@@ -23,6 +23,9 @@ GEMINI_FALLBACK_MODELS = [
 
 # Telegram Bot Configuration (Get from @BotFather on Telegram)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# Optional secret token for iOS Shortcuts / external HTTP API (`POST /api/ask`).
+# When unset, a dedicated secret is derived from TELEGRAM_BOT_TOKEN (only active if ALLOWED_TELEGRAM_USER_IDS is set).
+SHORTCUT_API_TOKEN = os.getenv("SHORTCUT_API_TOKEN", "").strip()
 # Automatically populated on Render via RENDER_EXTERNAL_URL; enables zero-conflict Telegram webhooks
 WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).strip().rstrip("/")
 # Comma-separated Telegram numeric user IDs allowed to query your private bank data (leave empty to allow any during initial test, then lock down!)

@@ -227,6 +227,107 @@ def _is_retryable_model_error(err: Exception) -> bool:
     )
 
 
+_AUDIO_MIME_ALIASES = {
+    "audio/x-m4a": "audio/mp4",
+    "audio/m4a": "audio/mp4",
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+    "audio/opus": "audio/ogg",
+    "audio/mp3": "audio/mpeg",
+    "application/ogg": "audio/ogg",
+}
+
+_AUDIO_EXT_TO_MIME = {
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".wav": "audio/wav",
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+}
+
+
+def normalize_audio_mime_type(
+    mime_type: str | None,
+    filename: str = "",
+    default: str = "audio/ogg",
+) -> str:
+    """Normalizes Telegram/iOS audio MIME types into formats accepted by Gemini."""
+    clean = (mime_type or "").split(";")[0].strip().lower()
+    if clean in _AUDIO_MIME_ALIASES:
+        return _AUDIO_MIME_ALIASES[clean]
+    if clean.startswith("audio/"):
+        return clean
+    lower_name = (filename or "").strip().lower()
+    for ext, mapped in _AUDIO_EXT_TO_MIME.items():
+        if lower_name.endswith(ext):
+            return mapped
+    return default
+
+
+def transcribe_audio_with_gemini(
+    audio_bytes: bytes,
+    mime_type: str = "audio/ogg",
+    filename: str = "",
+) -> str:
+    """Transcribes voice/audio recordings into plain text using Gemini multimodal fallback."""
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY is not set.")
+    if not audio_bytes:
+        raise ValueError("Audio recording is empty.")
+
+    clean_mime = normalize_audio_mime_type(mime_type, filename=filename)
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=45000))
+    prompt = (
+        "Transcribe this spoken audio verbatim in its original language (Indonesian or English), "
+        "preserving numbers, currency amounts, dates, and merchant names. "
+        "Output ONLY the plain-text transcription with no commentary or quotation marks."
+    )
+
+    last_err: Exception | None = None
+    for model_name in _model_candidates():
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=audio_bytes, mime_type=clean_mime),
+                    prompt,
+                ],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_level="LOW"),
+                    temperature=0.0,
+                ),
+            )
+            transcript = strip_markdown_syntax(response.text or "")
+            if not transcript:
+                raise ValueError("Could not detect clear speech in the audio recording.")
+            return transcript
+        except ValueError:
+            raise
+        except Exception as e:
+            last_err = e
+            if _is_retryable_model_error(e):
+                continue
+            raise
+
+    raise RuntimeError(f"Audio transcription failed across Gemini models: {last_err}")
+
+
+def answer_audio_question(
+    audio_bytes: bytes,
+    mime_type: str = "audio/ogg",
+    chat_history: List[Dict[str, str]] | None = None,
+    filename: str = "",
+) -> Dict[str, str]:
+    """Transcribes an audio recording and routes it through `ask_financial_ai`."""
+    transcript = transcribe_audio_with_gemini(audio_bytes, mime_type=mime_type, filename=filename)
+    answer = ask_financial_ai(transcript, chat_history)
+    return {"transcript": transcript, "answer": answer}
+
+
 def ask_financial_ai(user_question: str, chat_history: List[Dict[str, str]] | None = None) -> str:
     """
     Runs the Gemini Financial Advisor agent with pre-grounded SQL context,
