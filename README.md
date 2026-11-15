@@ -61,18 +61,19 @@ An open-source personal AI financial assistant for **Bank Central Asia (BCA)** u
 
 ---
 
-## ☁️ Free 24/7 Cloud Deployment (Render.com + Supabase + UptimeRobot)
+## ☁️ Free 24/7 Cloud Deployment (Render + Supabase + UptimeRobot)
 
 You can host your bot 24/7 for **$0/month (no credit card required)**:
 
 1. **Supabase (Free Cloud PostgreSQL)**:
    - Create a free project at [supabase.com](https://supabase.com).
-   - Go to **Project Settings → Database → Connection string → URI (Transaction Pooler, port 6543)** and copy your `postgresql://...` URI into `DATABASE_URL`.
-2. **Render.com (Free Web Service)**:
-   - Fork/clone this repo into your GitHub account.
-   - On [render.com](https://render.com), click **New → Web Service** (or **Blueprint** to auto-load `render.yaml`), choose the **Free** plan, and set your environment variables (`DATABASE_URL`, `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `ALLOWED_TELEGRAM_USER_IDS`, `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`).
-3. **Keep Alive 24/7 (Optional)**:
-   - Add your Render health check URL (`https://your-app.onrender.com/health`) to [UptimeRobot](https://uptimerobot.com) (free) with a 10-minute ping interval.
+   - Click **Connect** at the top of the project dashboard and copy the **Session Pooler (port 5432)** or **Transaction Pooler (port 6543)** URI (not Direct Connection, because Render uses IPv4), replacing `[YOUR-PASSWORD]` with your DB password.
+2. **Render.com (Free Web Service — Auto-Webhook)**:
+   - Fork/push this repo to your GitHub account.
+   - On [render.com](https://render.com), click **New → Blueprint** (select this repo to auto-load `render.yaml`) or **New → Web Service** (`pip install -r requirements.txt` / `python bot.py`), select the **Free** tier, and set your environment variables (`DATABASE_URL`, `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `ALLOWED_TELEGRAM_USER_IDS`, `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`).
+   - Render automatically provides `RENDER_EXTERNAL_URL`, so the bot switches to **Telegram Webhook mode** automatically (waking up on incoming Telegram messages even after sleep, and avoiding polling conflicts).
+3. **Keep Awake 24/7 & Instant Replies (Recommended)**:
+   - Add your Render health check URL (`https://your-app.onrender.com/health`) to [UptimeRobot](https://uptimerobot.com) (free) with a **10-minute** HTTP monitor. This keeps Render instant with zero cold starts, keeps background 5-minute Gmail auto-sync active, and prevents Supabase's 7-day inactivity pause.
 
 ---
 

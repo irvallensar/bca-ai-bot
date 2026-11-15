@@ -18,7 +18,7 @@ def get_connection():
     """Yields a DB connection compatible with either SQLite (local) or Supabase PostgreSQL (cloud)."""
     if IS_POSTGRES:
         # prepare_threshold=None prevents prepared-statement errors with Supabase PgBouncer (port 6543)
-        conn = psycopg.connect(DATABASE_URL, prepare_threshold=None)
+        conn = psycopg.connect(DATABASE_URL, prepare_threshold=None, connect_timeout=15)
         try:
             yield conn
             conn.commit()

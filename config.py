@@ -5,13 +5,13 @@ load_dotenv()
 
 # Database configuration:
 # Defaults to a local SQLite database for instant local testing.
-# For Render / Koyeb cloud deployment, set DATABASE_URL to your Supabase PostgreSQL URI:
+# For Render cloud deployment, set DATABASE_URL to your Supabase PostgreSQL Pooler URI:
 # e.g. postgresql://postgres.[project-ref]:[password]@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./mybca_transactions.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./mybca_transactions.db").strip()
 
 # Google Gemini API Key (Free tier from https://aistudio.google.com/apikey)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
 GEMINI_FALLBACK_MODELS = [
     m.strip()
     for m in os.getenv(
@@ -22,7 +22,9 @@ GEMINI_FALLBACK_MODELS = [
 ]
 
 # Telegram Bot Configuration (Get from @BotFather on Telegram)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# Automatically populated on Render via RENDER_EXTERNAL_URL; enables zero-conflict Telegram webhooks
+WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).strip().rstrip("/")
 # Comma-separated Telegram numeric user IDs allowed to query your private bank data (leave empty to allow any during initial test, then lock down!)
 ALLOWED_TELEGRAM_USER_IDS = [
     int(uid.strip())
@@ -31,8 +33,8 @@ ALLOWED_TELEGRAM_USER_IDS = [
 ]
 
 # Gmail IMAP Configuration for Automated Email Polling
-GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS", "")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS", "").strip()
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
 EMAIL_SYNC_INTERVAL_SECONDS = int(os.getenv("EMAIL_SYNC_INTERVAL_SECONDS", "300"))  # Every 5 mins
 
 # Default fallback exchange rates to IDR (updated dynamically or via e-Statement reconciliation)

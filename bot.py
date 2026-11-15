@@ -1,12 +1,14 @@
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import sys
 from contextlib import asynccontextmanager
-from typing import Dict, List
+from typing import Dict, List, Set
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -22,6 +24,7 @@ from config import (
     EMAIL_SYNC_INTERVAL_SECONDS,
     GMAIL_APP_PASSWORD,
     TELEGRAM_BOT_TOKEN,
+    WEBHOOK_URL,
 )
 from database import init_db, run_read_only_sql
 from gmail_sync import sync_from_gmail_imap
@@ -183,21 +186,59 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await thinking_msg.edit_text(f"⚠️ Error: {e}")
 
 
+def _webhook_secret() -> str:
+    """Derives a stable Telegram-compatible secret token ([A-Za-z0-9_-]) from the bot token."""
+    if not TELEGRAM_BOT_TOKEN:
+        return ""
+    return hashlib.sha256(TELEGRAM_BOT_TOKEN.encode("utf-8")).hexdigest()[:32]
+
+
+def _register_handlers(app_instance: Application) -> None:
+    app_instance.add_handler(CommandHandler("start", start_cmd))
+    app_instance.add_handler(CommandHandler("summary", summary_cmd))
+    app_instance.add_handler(CommandHandler("sync", sync_cmd))
+    app_instance.add_handler(CommandHandler("clear", clear_cmd))
+    app_instance.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_document_or_photo))
+    app_instance.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+
 async def periodic_gmail_sync_task() -> None:
     """Background task that polls Gmail IMAP every N minutes when GMAIL_APP_PASSWORD is set."""
+    is_first_run = True
     while True:
         if GMAIL_APP_PASSWORD:
             try:
-                stats = await asyncio.to_thread(sync_from_gmail_imap, 40)
-                if stats["inserted"] > 0:
-                    logger.info("Auto-synced %d new BCA transactions from Gmail.", stats["inserted"])
+                limit = 40
+                if is_first_run:
+                    rows = await asyncio.to_thread(run_read_only_sql, "SELECT COUNT(*) AS c FROM transactions;")
+                    if rows and int(rows[0]["c"]) == 0:
+                        limit = 150
+                stats = await asyncio.to_thread(sync_from_gmail_imap, limit)
+                if is_first_run or stats["inserted"] > 0:
+                    logger.info(
+                        "Gmail sync (limit=%d): scanned=%d inserted=%d skipped=%d",
+                        limit,
+                        stats["scanned"],
+                        stats["inserted"],
+                        stats["skipped_duplicates"],
+                    )
             except Exception as e:
                 logger.warning("Background Gmail sync warning: %s", e)
+            is_first_run = False
         await asyncio.sleep(EMAIL_SYNC_INTERVAL_SECONDS)
 
 
 telegram_app: Application | None = None
 bg_sync_task: asyncio.Task | None = None
+PENDING_WEBHOOK_TASKS: Set[asyncio.Task] = set()
+
+
+async def _process_webhook_update(update: Update) -> None:
+    try:
+        if telegram_app:
+            await telegram_app.process_update(update)
+    except Exception:
+        logger.exception("Error processing Telegram webhook update")
 
 
 @asynccontextmanager
@@ -207,18 +248,28 @@ async def lifespan(app: FastAPI):
     bg_sync_task = asyncio.create_task(periodic_gmail_sync_task())
 
     if TELEGRAM_BOT_TOKEN:
-        telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        telegram_app.add_handler(CommandHandler("start", start_cmd))
-        telegram_app.add_handler(CommandHandler("summary", summary_cmd))
-        telegram_app.add_handler(CommandHandler("sync", sync_cmd))
-        telegram_app.add_handler(CommandHandler("clear", clear_cmd))
-        telegram_app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_document_or_photo))
-        telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-        await telegram_app.initialize()
-        await telegram_app.start()
-        await telegram_app.updater.start_polling(drop_pending_updates=True)
-        logger.info("Telegram bot started polling!")
+        builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+        if WEBHOOK_URL:
+            # Webhook mode for Render / cloud hosting: wakes sleeping free-tier containers and avoids polling conflicts
+            telegram_app = builder.updater(None).build()
+            _register_handlers(telegram_app)
+            await telegram_app.initialize()
+            await telegram_app.start()
+            webhook_target = f"{WEBHOOK_URL}/telegram-webhook"
+            await telegram_app.bot.set_webhook(
+                url=webhook_target,
+                secret_token=_webhook_secret(),
+                drop_pending_updates=False,
+            )
+            logger.info("Telegram bot started in WEBHOOK mode: %s", webhook_target)
+        else:
+            telegram_app = builder.build()
+            _register_handlers(telegram_app)
+            await telegram_app.initialize()
+            await telegram_app.start()
+            await telegram_app.bot.delete_webhook(drop_pending_updates=False)
+            await telegram_app.updater.start_polling(drop_pending_updates=True)
+            logger.info("Telegram bot started in POLLING mode.")
     else:
         logger.warning("TELEGRAM_BOT_TOKEN not set yet. Running web server only.")
 
@@ -226,8 +277,15 @@ async def lifespan(app: FastAPI):
 
     if bg_sync_task:
         bg_sync_task.cancel()
+        try:
+            await bg_sync_task
+        except asyncio.CancelledError:
+            pass
+    if PENDING_WEBHOOK_TASKS:
+        await asyncio.wait(list(PENDING_WEBHOOK_TASKS), timeout=20.0)
     if telegram_app:
-        await telegram_app.updater.stop()
+        if telegram_app.updater and telegram_app.updater.running:
+            await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()
 
@@ -235,16 +293,49 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="myBCA & PasporBCA Financial AI Bot", lifespan=lifespan)
 
 
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    """Receives Telegram webhook POSTs cleanly and dispatches processing in the background."""
+    if not telegram_app:
+        raise HTTPException(status_code=503, detail="Telegram bot is not configured.")
+    expected_secret = _webhook_secret()
+    if expected_secret:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(header_secret, expected_secret):
+            raise HTTPException(status_code=403, detail="Invalid webhook secret.")
+
+    payload = await request.json()
+    update = Update.de_json(payload, telegram_app.bot)
+    if update is not None:
+        task = asyncio.create_task(_process_webhook_update(update))
+        PENDING_WEBHOOK_TASKS.add(task)
+        task.add_done_callback(PENDING_WEBHOOK_TASKS.discard)
+    return {"ok": True}
+
+
 @app.get("/")
 @app.get("/health")
 def health_check():
-    """Health check endpoint for Render / Koyeb / UptimeRobot."""
-    rows = run_read_only_sql("SELECT COUNT(*) as total_tx FROM transactions;")
-    return {
-        "status": "ok",
-        "service": "mybca-ai-bot",
-        "transactions_count": rows[0]["total_tx"] if rows else 0,
-    }
+    """Health check endpoint for Render / UptimeRobot (also keeps Supabase active)."""
+    mode = "webhook" if WEBHOOK_URL else ("polling" if TELEGRAM_BOT_TOKEN else "web_only")
+    try:
+        rows = run_read_only_sql("SELECT COUNT(*) as total_tx FROM transactions;")
+        return {
+            "status": "ok",
+            "service": "mybca-ai-bot",
+            "mode": mode,
+            "db_connected": True,
+            "transactions_count": rows[0]["total_tx"] if rows else 0,
+        }
+    except Exception as e:
+        logger.warning("Health check DB warning: %s", e)
+        return {
+            "status": "ok",
+            "service": "mybca-ai-bot",
+            "mode": mode,
+            "db_connected": False,
+            "error": str(e),
+        }
 
 
 def run_cli_chat():

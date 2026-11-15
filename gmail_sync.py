@@ -73,54 +73,61 @@ def sync_from_gmail_imap(max_messages_per_sender: int = 100) -> Dict[str, int]:
     init_db()
     stats = {"scanned": 0, "inserted": 0, "skipped_duplicates": 0}
 
-    mail = imaplib.IMAP4_SSL("imap.gmail.com")
-    mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-    mail.select("inbox", readonly=True)
+    mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
+    try:
+        mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        sel_status, _ = mail.select('"[Gmail]/All Mail"', readonly=True)
+        if sel_status != "OK":
+            mail.select("inbox", readonly=True)
 
-    queries = [
-        '(FROM "bca@bca.co.id")',
-        '(FROM "PasporBCA@klikbca.com")',
-    ]
+        queries = [
+            '(FROM "bca@bca.co.id")',
+            '(FROM "PasporBCA@klikbca.com")',
+        ]
 
-    for q in queries:
-        status, data = mail.search(None, q)
-        if status != "OK" or not data or not data[0]:
-            continue
-        msg_nums = data[0].split()
-        # Take the most recent N messages
-        recent_nums = msg_nums[-max_messages_per_sender:]
-        for num in reversed(recent_nums):
-            res, msg_data = mail.fetch(num, "(RFC822)")
-            if res != "OK" or not msg_data or not msg_data[0]:
+        for q in queries:
+            status, data = mail.search(None, q)
+            if status != "OK" or not data or not data[0]:
                 continue
-            raw_bytes = msg_data[0][1]
-            msg = email.message_from_bytes(raw_bytes)
-            subject = decode_mime_header(msg.get("Subject", ""))
-            sender = decode_mime_header(msg.get("From", ""))
-            msg_id = (msg.get("Message-ID") or "").strip("<> ")
-            date_hdr = msg.get("Date", "")
-            fallback_iso = None
-            if date_hdr:
-                try:
-                    dt = parsedate_to_datetime(date_hdr)
-                    fallback_iso = dt.strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
+            msg_nums = data[0].split()
+            # Take the most recent N messages
+            recent_nums = msg_nums[-max_messages_per_sender:]
+            for num in reversed(recent_nums):
+                res, msg_data = mail.fetch(num, "(RFC822)")
+                if res != "OK" or not msg_data or not msg_data[0]:
+                    continue
+                raw_bytes = msg_data[0][1]
+                msg = email.message_from_bytes(raw_bytes)
+                subject = decode_mime_header(msg.get("Subject", ""))
+                sender = decode_mime_header(msg.get("From", ""))
+                msg_id = (msg.get("Message-ID") or "").strip("<> ")
+                date_hdr = msg.get("Date", "")
+                fallback_iso = None
+                if date_hdr:
+                    try:
+                        dt = parsedate_to_datetime(date_hdr)
+                        fallback_iso = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        pass
 
-            body = extract_best_body_from_email_message(msg)
-            stats["scanned"] += 1
-            parsed = parse_bca_email(
-                body,
-                subject=subject,
-                sender=sender,
-                email_message_id=msg_id,
-                fallback_date_iso=fallback_iso,
-            )
-            if parsed:
-                if upsert_transaction(parsed):
-                    stats["inserted"] += 1
-                else:
-                    stats["skipped_duplicates"] += 1
+                body = extract_best_body_from_email_message(msg)
+                stats["scanned"] += 1
+                parsed = parse_bca_email(
+                    body,
+                    subject=subject,
+                    sender=sender,
+                    email_message_id=msg_id,
+                    fallback_date_iso=fallback_iso,
+                )
+                if parsed:
+                    if upsert_transaction(parsed):
+                        stats["inserted"] += 1
+                    else:
+                        stats["skipped_duplicates"] += 1
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
 
-    mail.logout()
     return stats
