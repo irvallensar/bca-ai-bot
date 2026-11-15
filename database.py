@@ -2,7 +2,7 @@ import hashlib
 import re
 import sqlite3
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, unquote
 
 from config import DATABASE_URL
@@ -14,6 +14,7 @@ if IS_POSTGRES:
     from psycopg.rows import dict_row
 
 _RESOLVED_POSTGRES_URL: Optional[str] = None
+_INITIALIZED_DB_URL: Optional[str] = None
 _POSTGRES_URI_RE = re.compile(
     r"^(postgres(?:ql)?)://(.+)@((?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(?::\d+)?)([/?#].*)?$"
 )
@@ -104,6 +105,10 @@ def get_connection():
 
 def init_db() -> None:
     """Initializes the transactions and merchant_rules tables in SQLite or Supabase Postgres."""
+    global _INITIALIZED_DB_URL
+    if _INITIALIZED_DB_URL == DATABASE_URL:
+        return
+
     id_col = "SERIAL PRIMARY KEY" if IS_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
     ts_default = " CURRENT_TIMESTAMP"
 
@@ -148,6 +153,7 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_tx_category ON transactions(category);",
         "CREATE INDEX IF NOT EXISTS idx_tx_direction ON transactions(direction);",
         "CREATE INDEX IF NOT EXISTS idx_tx_country ON transactions(country);",
+        "CREATE INDEX IF NOT EXISTS idx_tx_email_msg_id ON transactions(email_message_id);",
     ]
 
     with get_connection() as conn:
@@ -156,6 +162,8 @@ def init_db() -> None:
         cur.execute(create_rules_table)
         for idx_sql in create_indexes:
             cur.execute(idx_sql)
+
+    _INITIALIZED_DB_URL = DATABASE_URL
 
 
 def compute_dedup_key(
@@ -180,11 +188,31 @@ def compute_dedup_key(
     return "hash:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def upsert_transaction(tx: Dict[str, Any]) -> bool:
-    """
-    Inserts a transaction if not already present.
-    Returns True if a new row was inserted, False if it was skipped/updated as duplicate.
-    """
+def _extract_col(row: Any, idx: int, key: str) -> Any:
+    return row[key] if isinstance(row, dict) else row[idx]
+
+
+def _load_merchant_rules(cur: Any) -> List[Tuple[str, str]]:
+    """Loads custom merchant pattern rules once from an open database cursor."""
+    cur.execute("SELECT merchant_pattern, category FROM merchant_rules;")
+    rules: List[Tuple[str, str]] = []
+    for row in cur.fetchall():
+        pattern = _extract_col(row, 0, "merchant_pattern")
+        cat = _extract_col(row, 1, "category")
+        if pattern and cat:
+            rules.append((str(pattern).upper(), str(cat)))
+    return rules
+
+
+def _match_merchant_rule(merchant: str, rules: List[Tuple[str, str]]) -> Optional[str]:
+    m_upper = merchant.upper()
+    for pattern_upper, cat in rules:
+        if pattern_upper in m_upper:
+            return cat
+    return None
+
+
+def _build_tx_params(tx: Dict[str, Any], rules: List[Tuple[str, str]]) -> Tuple[Any, ...]:
     dedup_key = tx.get("dedup_key") or compute_dedup_key(
         tx.get("reference_no"),
         tx.get("email_message_id"),
@@ -194,12 +222,10 @@ def upsert_transaction(tx: Dict[str, Any]) -> bool:
         tx.get("currency", "IDR"),
     )
     tx_month = tx["tx_date"][:7]
-
-    # Check custom user merchant categorization rules first
-    custom_cat = get_custom_category_for_merchant(tx["merchant_or_party"])
+    custom_cat = _match_merchant_rule(tx["merchant_or_party"], rules)
     category = custom_cat or tx.get("category", "Miscellaneous")
 
-    params = (
+    return (
         dedup_key,
         tx.get("email_message_id"),
         tx.get("reference_no"),
@@ -222,26 +248,86 @@ def upsert_transaction(tx: Dict[str, Any]) -> bool:
         tx.get("raw_excerpt"),
     )
 
+
+def get_known_email_message_ids(message_ids: Optional[List[str]] = None) -> Set[str]:
+    """
+    Returns existing `email_message_id` values already stored in `transactions`.
+    If `message_ids` is provided, checks only those IDs in a single DB connection.
+    """
+    cleaned: Optional[List[str]] = None
+    if message_ids is not None:
+        cleaned = list(dict.fromkeys(m.strip("<> ") for m in message_ids if m and m.strip("<> ")))
+        if not cleaned:
+            return set()
+
+    known: Set[str] = set()
     with get_connection() as conn:
         cur = conn.cursor()
-        if IS_POSTGRES:
-            sql = """
-            INSERT INTO transactions (
-                dedup_key, email_message_id, reference_no, tx_date, tx_month,
-                direction, source_channel, tx_type, merchant_or_party, beneficiary_account,
-                location, country, category, currency, amount_original,
-                fx_rate_to_idr, amount_idr, source_of_fund, remarks, raw_excerpt
-            ) VALUES (
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s
+        if cleaned is None:
+            cur.execute("SELECT email_message_id FROM transactions WHERE email_message_id IS NOT NULL;")
+            for row in cur.fetchall():
+                val = _extract_col(row, 0, "email_message_id")
+                if val:
+                    known.add(str(val).strip("<> "))
+        elif IS_POSTGRES:
+            cur.execute(
+                "SELECT email_message_id FROM transactions WHERE email_message_id = ANY(%s);",
+                (cleaned,),
             )
-            ON CONFLICT (dedup_key) DO NOTHING
-            RETURNING id;
-            """
-            cur.execute(sql, params)
-            return cur.fetchone() is not None
+            for row in cur.fetchall():
+                val = _extract_col(row, 0, "email_message_id")
+                if val:
+                    known.add(str(val).strip("<> "))
+        else:
+            chunk_size = 500
+            for i in range(0, len(cleaned), chunk_size):
+                chunk = cleaned[i : i + chunk_size]
+                placeholders = ", ".join(["?"] * len(chunk))
+                cur.execute(
+                    f"SELECT email_message_id FROM transactions WHERE email_message_id IN ({placeholders});",
+                    chunk,
+                )
+                for row in cur.fetchall():
+                    val = _extract_col(row, 0, "email_message_id")
+                    if val:
+                        known.add(str(val).strip("<> "))
+    return known
+
+
+def upsert_transactions_batch(txs: List[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    Batch-inserts transactions using a single DB connection and single merchant_rules load.
+    Returns `{"inserted": <int>, "skipped_duplicates": <int>}`.
+    """
+    if not txs:
+        return {"inserted": 0, "skipped_duplicates": 0}
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        rules = _load_merchant_rules(cur)
+        params_list = [_build_tx_params(tx, rules) for tx in txs]
+
+        if IS_POSTGRES:
+            row_placeholder = "(" + ", ".join(["%s"] * 20) + ")"
+            chunk_size = 500
+            inserted = 0
+            for i in range(0, len(params_list), chunk_size):
+                chunk = params_list[i : i + chunk_size]
+                values_sql = ",\n".join([row_placeholder] * len(chunk))
+                flat_params = [val for row in chunk for val in row]
+                sql = f"""
+                INSERT INTO transactions (
+                    dedup_key, email_message_id, reference_no, tx_date, tx_month,
+                    direction, source_channel, tx_type, merchant_or_party, beneficiary_account,
+                    location, country, category, currency, amount_original,
+                    fx_rate_to_idr, amount_idr, source_of_fund, remarks, raw_excerpt
+                ) VALUES
+                {values_sql}
+                ON CONFLICT (dedup_key) DO NOTHING
+                RETURNING id;
+                """
+                cur.execute(sql, flat_params)
+                inserted += len(cur.fetchall())
         else:
             sql = """
             INSERT OR IGNORE INTO transactions (
@@ -256,23 +342,30 @@ def upsert_transaction(tx: Dict[str, Any]) -> bool:
                 ?, ?, ?, ?, ?
             );
             """
-            cur.execute(sql, params)
-            return cur.rowcount > 0
+            before = conn.total_changes
+            cur.executemany(sql, params_list)
+            inserted = conn.total_changes - before
+
+    return {
+        "inserted": inserted,
+        "skipped_duplicates": len(params_list) - inserted,
+    }
+
+
+def upsert_transaction(tx: Dict[str, Any]) -> bool:
+    """
+    Inserts a transaction if not already present.
+    Returns True if a new row was inserted, False if it was skipped/updated as duplicate.
+    """
+    return upsert_transactions_batch([tx])["inserted"] > 0
 
 
 def get_custom_category_for_merchant(merchant: str) -> Optional[str]:
     """Checks if the user has defined a custom category rule for a merchant substring."""
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT merchant_pattern, category FROM merchant_rules;")
-        rows = cur.fetchall()
-        m_upper = merchant.upper()
-        for row in rows:
-            pattern = row[0] if not isinstance(row, dict) else row["merchant_pattern"]
-            cat = row[1] if not isinstance(row, dict) else row["category"]
-            if pattern.upper() in m_upper:
-                return cat
-    return None
+        rules = _load_merchant_rules(cur)
+        return _match_merchant_rule(merchant, rules)
 
 
 def set_merchant_category_rule(merchant_pattern: str, category: str, notes: str = "") -> int:

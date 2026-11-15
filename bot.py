@@ -37,6 +37,7 @@ logger = logging.getLogger("mybca-bot")
 
 # Simple in-memory conversation memory per Telegram user
 USER_HISTORY: Dict[int, List[Dict[str, str]]] = {}
+SYNC_LOCK = asyncio.Lock()
 
 
 def is_authorized(user_id: int) -> bool:
@@ -114,9 +115,16 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
-    status_msg = await update.message.reply_text("🔄 Syncing BCA & PasporBCA emails from Gmail...")
+    status_msg = await update.message.reply_text("🔄 Syncing BCA & PasporBCA emails from Gmail...(this may take a while)")
     try:
-        stats = await asyncio.to_thread(sync_from_gmail_imap, 100)
+        async with SYNC_LOCK:
+            stats = await asyncio.to_thread(sync_from_gmail_imap, 100)
+        logger.info(
+            "Manual Telegram /sync: scanned=%d inserted=%d skipped=%d",
+            stats["scanned"],
+            stats["inserted"],
+            stats["skipped_duplicates"],
+        )
         await status_msg.edit_text(
             f"✅ *Gmail Sync Complete!*\n"
             f"• Emails scanned: `{stats['scanned']}`\n"
@@ -213,7 +221,8 @@ async def periodic_gmail_sync_task() -> None:
                     rows = await asyncio.to_thread(run_read_only_sql, "SELECT COUNT(*) AS c FROM transactions;")
                     if rows and int(rows[0]["c"]) == 0:
                         limit = 150
-                stats = await asyncio.to_thread(sync_from_gmail_imap, limit)
+                async with SYNC_LOCK:
+                    stats = await asyncio.to_thread(sync_from_gmail_imap, limit)
                 if is_first_run or stats["inserted"] > 0:
                     logger.info(
                         "Gmail sync (limit=%d): scanned=%d inserted=%d skipped=%d",
