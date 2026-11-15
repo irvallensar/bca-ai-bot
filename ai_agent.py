@@ -145,7 +145,7 @@ def get_financial_context_block() -> str:
             FROM transactions
             GROUP BY tx_month, direction, country, currency
             ORDER BY tx_month DESC, total_idr DESC
-            LIMIT 36;
+            LIMIT 100;
             """
         )
         category_totals = run_read_only_sql(
@@ -156,7 +156,7 @@ def get_financial_context_block() -> str:
             FROM transactions
             GROUP BY tx_month, direction, category
             ORDER BY tx_month DESC, total_idr DESC
-            LIMIT 60;
+            LIMIT 120;
             """
         )
         merchant_breakdown = run_read_only_sql(

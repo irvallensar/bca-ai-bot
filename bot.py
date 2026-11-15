@@ -115,12 +115,22 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
+    limit: int | None = None
+    if context.args:
+        try:
+            parsed_limit = int(context.args[0])
+            if parsed_limit > 0:
+                limit = parsed_limit
+        except ValueError:
+            pass
+
     status_msg = await update.message.reply_text("🔄 Syncing BCA & PasporBCA emails from Gmail...(this may take a while)")
     try:
         async with SYNC_LOCK:
-            stats = await asyncio.to_thread(sync_from_gmail_imap, 100)
+            stats = await asyncio.to_thread(sync_from_gmail_imap, limit)
         logger.info(
-            "Manual Telegram /sync: scanned=%d inserted=%d skipped=%d",
+            "Manual Telegram /sync (limit=%s): scanned=%d inserted=%d skipped=%d",
+            limit if limit is not None else "all",
             stats["scanned"],
             stats["inserted"],
             stats["skipped_duplicates"],
@@ -211,22 +221,18 @@ def _register_handlers(app_instance: Application) -> None:
 
 
 async def periodic_gmail_sync_task() -> None:
-    """Background task that polls Gmail IMAP every N minutes when GMAIL_APP_PASSWORD is set."""
+    """Background task that backfills full history on startup and polls recent Gmail every N minutes."""
     is_first_run = True
     while True:
         if GMAIL_APP_PASSWORD:
             try:
-                limit = 40
-                if is_first_run:
-                    rows = await asyncio.to_thread(run_read_only_sql, "SELECT COUNT(*) AS c FROM transactions;")
-                    if rows and int(rows[0]["c"]) == 0:
-                        limit = 150
+                limit: int | None = None if is_first_run else 50
                 async with SYNC_LOCK:
                     stats = await asyncio.to_thread(sync_from_gmail_imap, limit)
                 if is_first_run or stats["inserted"] > 0:
                     logger.info(
-                        "Gmail sync (limit=%d): scanned=%d inserted=%d skipped=%d",
-                        limit,
+                        "Gmail sync (limit=%s): scanned=%d inserted=%d skipped=%d",
+                        limit if limit is not None else "all",
                         stats["scanned"],
                         stats["inserted"],
                         stats["skipped_duplicates"],

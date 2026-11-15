@@ -159,10 +159,11 @@ def _parse_raw_email_message(raw_bytes: bytes) -> Optional[Dict[str, Any]]:
     )
 
 
-def sync_from_gmail_imap(max_messages_per_sender: int = 100) -> Dict[str, int]:
+def sync_from_gmail_imap(max_messages_per_sender: Optional[int] = None) -> Dict[str, int]:
     """
     Connects to Gmail IMAP using GMAIL_ADDRESS + GMAIL_APP_PASSWORD,
-    fetches emails from `bca@bca.co.id` and `PasporBCA@klikbca.com`,
+    fetches emails from `bca@bca.co.id` and `PasporBCA@klikbca.com`
+    (all matching emails when `max_messages_per_sender` is None),
     skips emails whose Message-ID is already stored, parses new ones,
     and batch-inserts new transactions into the database.
     """
@@ -192,7 +193,12 @@ def sync_from_gmail_imap(max_messages_per_sender: int = 100) -> Dict[str, int]:
             if status != "OK" or not data or not data[0]:
                 continue
             msg_nums = data[0].split()
-            for num in reversed(msg_nums[-max_messages_per_sender:]):
+            target_nums = (
+                msg_nums
+                if not max_messages_per_sender or max_messages_per_sender <= 0
+                else msg_nums[-max_messages_per_sender:]
+            )
+            for num in reversed(target_nums):
                 if num not in seen_seq:
                     seen_seq.add(num)
                     candidate_nums.append(num)
