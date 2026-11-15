@@ -3,6 +3,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote, unquote
 
 from config import DATABASE_URL
 
@@ -12,13 +13,68 @@ if IS_POSTGRES:
     import psycopg
     from psycopg.rows import dict_row
 
+_RESOLVED_POSTGRES_URL: Optional[str] = None
+_POSTGRES_URI_RE = re.compile(
+    r"^(postgres(?:ql)?)://(.+)@((?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(?::\d+)?)([/?#].*)?$"
+)
+
+
+def _encode_pg_password(pw: str) -> str:
+    """Percent-encodes reserved URI characters in a Postgres password without double-encoding %XX."""
+    if not re.search(r"[^A-Za-z0-9._~-]", pw):
+        return pw
+    if re.search(r"%[0-9A-Fa-f]{2}", pw):
+        return quote(unquote(pw), safe="")
+    return quote(pw, safe="")
+
+
+def _postgres_dsn_candidates(raw_url: str) -> List[str]:
+    """
+    Normalizes a PostgreSQL URI so passwords with unencoded special characters
+    (e.g. `@`, `!`, `#`) or accidental template brackets (`[YOUR-PASSWORD]`) connect cleanly.
+    """
+    url = raw_url.strip()
+    m = _POSTGRES_URI_RE.match(url)
+    if not m:
+        return [url]
+    scheme, user_pass, host_port, suffix = m.groups()
+    suffix = suffix or ""
+    if ":" not in user_pass:
+        return [url]
+    user, _, raw_pw = user_pass.partition(":")
+
+    candidates: List[str] = []
+    if len(raw_pw) >= 2 and raw_pw.startswith("[") and raw_pw.endswith("]"):
+        inner_pw = _encode_pg_password(raw_pw[1:-1])
+        candidates.append(f"{scheme}://{user}:{inner_pw}@{host_port}{suffix}")
+    encoded_pw = _encode_pg_password(raw_pw)
+    literal_uri = f"{scheme}://{user}:{encoded_pw}@{host_port}{suffix}"
+    if literal_uri not in candidates:
+        candidates.append(literal_uri)
+    return candidates
+
 
 @contextmanager
 def get_connection():
     """Yields a DB connection compatible with either SQLite (local) or Supabase PostgreSQL (cloud)."""
+    global _RESOLVED_POSTGRES_URL
     if IS_POSTGRES:
         # prepare_threshold=None prevents prepared-statement errors with Supabase PgBouncer (port 6543)
-        conn = psycopg.connect(DATABASE_URL, prepare_threshold=None, connect_timeout=15)
+        if _RESOLVED_POSTGRES_URL:
+            conn = psycopg.connect(_RESOLVED_POSTGRES_URL, prepare_threshold=None, connect_timeout=15)
+        else:
+            candidates = _postgres_dsn_candidates(DATABASE_URL)
+            conn = None
+            last_err: Optional[Exception] = None
+            for dsn in candidates:
+                try:
+                    conn = psycopg.connect(dsn, prepare_threshold=None, connect_timeout=15)
+                    _RESOLVED_POSTGRES_URL = dsn
+                    break
+                except Exception as e:
+                    last_err = e
+            if conn is None:
+                raise last_err  # type: ignore[misc]
         try:
             yield conn
             conn.commit()
@@ -28,6 +84,11 @@ def get_connection():
         finally:
             conn.close()
     else:
+        if DATABASE_URL.startswith(("http://", "https://")):
+            raise ValueError(
+                "DATABASE_URL is an HTTP(S) URL instead of a PostgreSQL connection string "
+                "(postgresql://...). Copy the Pooler URI from Supabase Connect."
+            )
         db_path = DATABASE_URL.replace("sqlite:///", "")
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
