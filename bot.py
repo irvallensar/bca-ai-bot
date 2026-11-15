@@ -419,7 +419,7 @@ def _extract_bearer_token(request: Request) -> str:
     auth_header = request.headers.get("Authorization", "").strip()
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
-    return request.headers.get("X-Api-Key", "").strip()
+    return auth_header or request.headers.get("X-Api-Key", "").strip()
 
 
 @app.post("/api/ask")
