@@ -64,14 +64,46 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+def split_telegram_text(text: str, limit: int = 4000) -> List[str]:
+    """Splits long AI responses cleanly so they never exceed Telegram's 4096-char limit."""
+    if len(text) <= limit:
+        return [text]
+    chunks: List[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = remaining.rfind(" ", 0, limit)
+        if split_at <= 0:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    return chunks
+
+
+async def edit_with_long_response(thinking_msg, update: Update, text: str) -> None:
+    """Edits the thinking placeholder with the first chunk and sends follow-up messages if >4096 chars."""
+    chunks = split_telegram_text(text)
+    await thinking_msg.edit_text(chunks[0])
+    for extra in chunks[1:]:
+        await update.message.reply_text(extra)
+
+
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
-    answer = await asyncio.to_thread(
-        ask_financial_ai,
-        "Give me a clean summary of my latest month's cashflow (total spending, total income if any, and breakdown by category with percentages, plus top 5 largest expenses).",
-    )
-    await update.message.reply_text(answer)
+    thinking_msg = await update.message.reply_text("💭 Generating monthly cashflow summary...")
+    try:
+        answer = await asyncio.to_thread(
+            ask_financial_ai,
+            "Give me a clean summary of my latest month's cashflow (total spending, total income if any, and breakdown by category with percentages, plus top 5 largest expenses).",
+        )
+        await edit_with_long_response(thinking_msg, update, answer)
+    except Exception as e:
+        await thinking_msg.edit_text(f"⚠️ Error: {e}")
 
 
 async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -144,7 +176,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         history.append({"role": "model", "text": answer})
         if len(history) > 12:
             del history[:-12]
-        await thinking_msg.edit_text(answer)
+        await edit_with_long_response(thinking_msg, update, answer)
     except Exception as e:
         await thinking_msg.edit_text(f"⚠️ Error: {e}")
 

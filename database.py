@@ -9,15 +9,16 @@ from config import DATABASE_URL
 IS_POSTGRES = DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
 
 if IS_POSTGRES:
-    import psycopg2
-    import psycopg2.extras
+    import psycopg
+    from psycopg.rows import dict_row
 
 
 @contextmanager
 def get_connection():
     """Yields a DB connection compatible with either SQLite (local) or Supabase PostgreSQL (cloud)."""
     if IS_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
+        # prepare_threshold=None prevents prepared-statement errors with Supabase PgBouncer (port 6543)
+        conn = psycopg.connect(DATABASE_URL, prepare_threshold=None)
         try:
             yield conn
             conn.commit()
@@ -262,9 +263,9 @@ def run_read_only_sql(sql_query: str) -> List[Dict[str, Any]]:
 
     with get_connection() as conn:
         if IS_POSTGRES:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(cleaned)
-            return [dict(r) for r in cur.fetchall()]
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(cleaned)
+                return list(cur.fetchall())
         else:
             cur = conn.cursor()
             cur.execute(cleaned)

@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -82,6 +83,7 @@ def log_manual_transaction(
         cat_clean = "Income / Earning" if dir_clean == "IN" and category not in MYBCA_CATEGORIES else category
 
         tx = {
+            "dedup_key": f"manual:{uuid.uuid4().hex[:16]}",
             "tx_date": now_str,
             "direction": dir_clean,
             "source_channel": "Manual Telegram",
@@ -154,7 +156,7 @@ Core Guidelines:
    - Cite the exact merchants (e.g., `JCO DONUTS`, `DCREPES`, `SEVEN-ELEVEN`, `BANKARASINJUKUSANCYO`, `GOPAY TOPUP`), exact transaction counts, and exact IDR/JPY amounts from your query results.
    - Give concrete, actionable monthly savings targets (e.g., "Cutting X from 4x/month to 2x/month saves IDR Y").
 3. Remember that `amount_idr` holds the unified IDR amount for both local (`IDR`) and overseas (`JPY`) transactions, while `amount_original` and `currency` hold the original currency value. Mention both when discussing overseas/Japan transactions!
-4. Keep formatting clean and easy to read on Telegram (use bullet points and bold numbers).
+4. Keep formatting clean and easy to read on Telegram (use bullet points, plain text or simple bolding, avoid wide Markdown tables, and keep responses under 3,500 characters).
 """
 
     client = genai.Client(api_key=GEMINI_API_KEY)
