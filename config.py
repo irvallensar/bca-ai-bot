@@ -11,7 +11,15 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./mybca_transactions.db")
 
 # Google Gemini API Key (Free tier from https://aistudio.google.com/apikey)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash",
+    ).split(",")
+    if m.strip()
+]
 
 # Telegram Bot Configuration (Get from @BotFather on Telegram)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")

@@ -28,6 +28,8 @@ from gmail_sync import sync_from_gmail_imap
 from statement_parser import parse_and_ingest_statement_file
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("google_genai").setLevel(logging.WARNING)
 logger = logging.getLogger("mybca-bot")
 
 # Simple in-memory conversation memory per Telegram user
@@ -267,14 +269,18 @@ def run_cli_chat():
             continue
         if q.lower() in ("exit", "quit"):
             break
-        ans = ask_financial_ai(q, history)
-        history.append({"role": "user", "text": q})
-        history.append({"role": "model", "text": ans})
-        print(f"\nAI >\n{ans}\n")
+        try:
+            ans = ask_financial_ai(q, history)
+            history.append({"role": "user", "text": q})
+            history.append({"role": "model", "text": ans})
+            print(f"\nAI >\n{ans}\n")
+        except Exception as e:
+            print(f"\n⚠️ Error: {e}\n")
 
 
 if __name__ == "__main__":
     if "--cli" in sys.argv:
+        logging.getLogger().setLevel(logging.WARNING)
         run_cli_chat()
     else:
         port = int(os.getenv("PORT", "8000"))

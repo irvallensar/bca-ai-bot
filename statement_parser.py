@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 from google import genai
 from google.genai import types
 
-from config import GEMINI_API_KEY, GEMINI_MODEL, MYBCA_CATEGORIES
+from config import GEMINI_API_KEY, GEMINI_FALLBACK_MODELS, GEMINI_MODEL, MYBCA_CATEGORIES
 from database import init_db, upsert_transaction
 
 STATEMENT_EXTRACTION_PROMPT = f"""
@@ -38,7 +38,7 @@ Return ONLY a valid JSON array where each element has:
 
 def parse_and_ingest_statement_file(file_bytes: bytes, mime_type: str = "application/pdf") -> Dict[str, Any]:
     """
-    Sends a myBCA e-Statement PDF or receipt screenshot to Gemini 2.5 Flash,
+    Sends a myBCA e-Statement PDF or receipt screenshot to Gemini 3.6 Flash,
     extracts all transactions (both IN and OUT), and upserts them into the database
     with automatic deduplication.
     """
@@ -46,19 +46,39 @@ def parse_and_ingest_statement_file(file_bytes: bytes, mime_type: str = "applica
         raise ValueError("GEMINI_API_KEY is not set in environment/.env.")
 
     init_db()
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=60000))
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-            STATEMENT_EXTRACTION_PROMPT,
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.1,
-        ),
-    )
+    candidates = []
+    for m in [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS:
+        if m and m not in candidates:
+            candidates.append(m)
+
+    response = None
+    last_err: Exception | None = None
+    for model_name in candidates:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                    STATEMENT_EXTRACTION_PROMPT,
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(thinking_level="LOW"),
+                    temperature=0.1,
+                ),
+            )
+            break
+        except Exception as e:
+            last_err = e
+            msg = str(e).upper()
+            if any(t in msg for t in ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND", "TIMEOUT", "503")):
+                continue
+            raise
+
+    if response is None:
+        raise RuntimeError(f"All Gemini models failed or hit quota limits: {last_err}")
 
     items: List[Dict[str, Any]] = json.loads(response.text)
     inserted = 0

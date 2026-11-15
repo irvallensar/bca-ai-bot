@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List
@@ -9,6 +10,7 @@ from google.genai import types
 from config import (
     DEFAULT_FX_RATES_TO_IDR,
     GEMINI_API_KEY,
+    GEMINI_FALLBACK_MODELS,
     GEMINI_MODEL,
     MYBCA_CATEGORIES,
 )
@@ -126,10 +128,109 @@ def recategorize_merchant(merchant_pattern: str, new_category: str) -> str:
         return json.dumps({"status": "error", "error": str(e)})
 
 
+def get_financial_context_block() -> str:
+    """
+    Pre-fetches a compact SQL summary (monthly totals, category/merchant aggregates,
+    and latest transactions) so most questions finish in a single API call with exact
+    SQL numbers, conserving free-tier RPM/RPD quota.
+    """
+    try:
+        total_rows = run_read_only_sql("SELECT COUNT(*) AS cnt FROM transactions;")[0]["cnt"]
+        monthly_totals = run_read_only_sql(
+            """
+            SELECT tx_month, direction, country, currency,
+                   COUNT(*) AS tx_count,
+                   SUM(amount_original) AS total_orig,
+                   ROUND(SUM(amount_idr)) AS total_idr
+            FROM transactions
+            GROUP BY tx_month, direction, country, currency
+            ORDER BY tx_month DESC, total_idr DESC
+            LIMIT 36;
+            """
+        )
+        category_totals = run_read_only_sql(
+            """
+            SELECT tx_month, direction, category,
+                   COUNT(*) AS tx_count,
+                   ROUND(SUM(amount_idr)) AS total_idr
+            FROM transactions
+            GROUP BY tx_month, direction, category
+            ORDER BY tx_month DESC, total_idr DESC
+            LIMIT 60;
+            """
+        )
+        merchant_breakdown = run_read_only_sql(
+            """
+            SELECT tx_month, direction, country, category, merchant_or_party, currency,
+                   COUNT(*) AS tx_count,
+                   SUM(amount_original) AS total_orig,
+                   ROUND(SUM(amount_idr)) AS total_idr
+            FROM transactions
+            GROUP BY tx_month, direction, country, category, merchant_or_party, currency
+            ORDER BY tx_month DESC, total_idr DESC
+            LIMIT 120;
+            """
+        )
+        recent_tx = run_read_only_sql(
+            """
+            SELECT tx_date, direction, country, category, merchant_or_party, currency,
+                   amount_original, amount_idr, remarks
+            FROM transactions
+            ORDER BY tx_date DESC
+            LIMIT 30;
+            """
+        )
+        return (
+            f"Total DB transactions: {total_rows}\n"
+            f"Monthly Totals by Country/Currency: {json.dumps(monthly_totals)}\n"
+            f"Monthly Totals by Category: {json.dumps(category_totals)}\n"
+            f"Category & Merchant Breakdown (top 120 groups): {json.dumps(merchant_breakdown)}\n"
+            f"Latest 30 Transactions: {json.dumps(recent_tx)}"
+        )
+    except Exception:
+        return "Database snapshot unavailable; use execute_sql_query."
+
+
+def strip_markdown_syntax(text: str) -> str:
+    """Normalizes any leftover Markdown syntax into clean plain text with Unicode bullets."""
+    # Convert leading markdown bullets (- or *) into clean • bullets while keeping indentation
+    cleaned = re.sub(r"^(\s*)[*-]\s+", r"\1• ", text, flags=re.MULTILINE)
+    # Remove markdown heading markers (e.g. ### Title -> Title)
+    cleaned = re.sub(r"^\s*#{1,6}\s+", "", cleaned, flags=re.MULTILINE)
+    # Remove horizontal rule lines (---, ***, ___)
+    cleaned = re.sub(r"^\s*[-*_]{3,}\s*$", "", cleaned, flags=re.MULTILINE)
+    # Remove bold (**text**, __text__), italic (*text*), and inline code (`text`) wrappers
+    cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__(.+?)__", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\w)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\w)", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`\n]+?)`", r"\1", cleaned)
+    # Collapse excessive blank lines left by removed --- dividers
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _model_candidates() -> List[str]:
+    seen = set()
+    ordered = []
+    for m in [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS:
+        if m and m not in seen:
+            seen.add(m)
+            ordered.append(m)
+    return ordered
+
+
+def _is_retryable_model_error(err: Exception) -> bool:
+    msg = str(err).upper()
+    return any(
+        token in msg
+        for token in ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND", "TIMEOUT", "READTIMEOUT", "503", "UNAVAILABLE")
+    )
+
+
 def ask_financial_ai(user_question: str, chat_history: List[Dict[str, str]] | None = None) -> str:
     """
-    Runs the Gemini Financial Advisor agent with SQL Tool Calling, manual logging,
-    and recategorization tools.
+    Runs the Gemini Financial Advisor agent with pre-grounded SQL context,
+    SQL Tool Calling, manual logging, recategorization, and automatic model fallback.
     """
     if not GEMINI_API_KEY:
         return (
@@ -140,40 +241,58 @@ def ask_financial_ai(user_question: str, chat_history: List[Dict[str, str]] | No
     init_db()
     sql_dialect = "PostgreSQL" if IS_POSTGRES else "SQLite"
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db_context = get_financial_context_block()
 
     system_instruction = f"""
 You are a personal myBCA & PasporBCA Financial AI Assistant.
 Current local date/time: {now_str}
 Database SQL Dialect: {sql_dialect}
 
-You have direct access to the user's real BCA & PasporBCA transactions table via `execute_sql_query`,
-can log manual income/expenses via `log_manual_transaction`, and can update merchant categories via `recategorize_merchant`.
+Pre-loaded Live SQL Summary:
+{db_context}
+
+You also have tools: `execute_sql_query` (for deeper/older queries not covered above), `log_manual_transaction`, and `recategorize_merchant`.
 
 Core Guidelines:
-1. NEVER guess or hallucinate numbers. Always call `execute_sql_query` first to inspect the actual data!
-2. For complex questions like "How can I reduce/save my spendings?" or "How can I reduce food/beverage spendings?":
-   - Run 1 to 3 targeted SQL queries (e.g., breakdown by category, top merchants by frequency and total IDR, weekday vs weekend or time-of-day habits, recurring small purchases like coffee/snacks/convenience stores, or Japan vs Indonesia comparisons).
-   - Cite the exact merchants (e.g., `JCO DONUTS`, `DCREPES`, `SEVEN-ELEVEN`, `BANKARASINJUKUSANCYO`, `GOPAY TOPUP`), exact transaction counts, and exact IDR/JPY amounts from your query results.
+1. NEVER guess or hallucinate numbers. Answer directly from the Pre-loaded Live SQL Summary whenever all needed numbers are already there (so you respond in 1 fast call!). Call `execute_sql_query` ONLY if the question needs older history, custom filters, or details not in the summary above.
+2. Strict Grounding: ONLY state categories, merchants, transaction counts, and amounts that explicitly appear in the pre-loaded SQL data or `execute_sql_query` results. Never extrapolate, split, or guess unqueried breakdowns.
+3. For complex questions like "How can I reduce/save my spendings?" or "How can I reduce food/beverage spendings?":
+   - Check both `Food & Beverage` and related convenience-store/snack purchases (e.g. `Groceries` like `SEVEN-ELEVEN` or `MIDI REGULER D`), plus merchant counts, exact IDR/JPY totals, and transaction timestamps.
+   - Cite the exact merchants, exact transaction counts, and exact IDR/JPY amounts.
    - Give concrete, actionable monthly savings targets (e.g., "Cutting X from 4x/month to 2x/month saves IDR Y").
-3. Remember that `amount_idr` holds the unified IDR amount for both local (`IDR`) and overseas (`JPY`) transactions, while `amount_original` and `currency` hold the original currency value. Mention both when discussing overseas/Japan transactions!
-4. Keep formatting clean and easy to read on Telegram (use bullet points, plain text or simple bolding, avoid wide Markdown tables, and keep responses under 3,500 characters).
+4. Remember that `amount_idr` holds the unified IDR amount for both local (`IDR`) and overseas (`JPY`) transactions, while `amount_original` and `currency` hold the original currency value. Mention both when discussing overseas/Japan transactions!
+5. Formatting: Output clean PLAIN TEXT only. Do NOT use Markdown syntax (`**`, `*`, `#`, `###`, `---`, backticks, or Markdown tables). Instead, use clean line breaks, emoji/plain-text section headers, and `•` Unicode bullets for lists, keeping responses under 3,500 characters.
 """
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    contents = []
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=45000))
+    history = []
     if chat_history:
         for msg in chat_history[-6:]:
             role = "user" if msg["role"] == "user" else "model"
-            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["text"])]))
-    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_question)]))
+            history.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["text"])]))
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            tools=[execute_sql_query, log_manual_transaction, recategorize_merchant],
-            temperature=0.2,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        tools=[execute_sql_query, log_manual_transaction, recategorize_merchant],
+        thinking_config=types.ThinkingConfig(thinking_level="LOW"),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=4),
+        temperature=0.1,
     )
-    return response.text or "I processed your request, but no text response was generated."
+
+    last_err: Exception | None = None
+    for model_name in _model_candidates():
+        try:
+            chat = client.chats.create(model=model_name, config=config, history=history or None)
+            response = chat.send_message(user_question)
+            raw_text = response.text or "I processed your request, but no text response was generated."
+            return strip_markdown_syntax(raw_text)
+        except Exception as e:
+            last_err = e
+            if _is_retryable_model_error(e):
+                continue
+            raise
+
+    return (
+        f"⚠️ All configured Gemini free-tier models are currently rate-limited or unavailable.\n"
+        f"Last error: {last_err}"
+    )

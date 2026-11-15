@@ -1,6 +1,6 @@
 # 🏦 bca-ai-bot — Personal myBCA & PasporBCA Financial AI
 
-An open-source personal AI financial assistant for **Bank Central Asia (BCA)** users. It automatically parses your **myBCA (`bca@bca.co.id`)** and **PasporBCA (`PasporBCA@klikbca.com`)** transaction notification emails, reconciles **myBCA e-Statement PDFs** and manual income logs, and answers complex spending & saving questions via **Telegram** (or terminal CLI) using **Google Gemini 2.5 Flash** + **SQL Tool Calling**.
+An open-source personal AI financial assistant for **Bank Central Asia (BCA)** users. It automatically parses your **myBCA (`bca@bca.co.id`)** and **PasporBCA (`PasporBCA@klikbca.com`)** transaction notification emails, reconciles **myBCA e-Statement PDFs** and manual income logs, and answers complex spending & saving questions via **Telegram** (or terminal CLI) using **Google Gemini 3.6 Flash** + **SQL Tool Calling**.
 
 ---
 
@@ -19,7 +19,7 @@ An open-source personal AI financial assistant for **Bank Central Asia (BCA)** u
 
 2. **Hybrid Income & e-Statement PDF Sync (`statement_parser.py` & `ai_agent.py`)**
    - **Manual Chat Logging**: Since BCA does not send emails for incoming transfers, simply message the bot `"+5,000,000 salary"` or `"+150k from friend for dinner"`—the AI automatically logs it as `IN` (`Income / Earning`).
-   - **Monthly myBCA e-Statement PDF / Screenshot Upload**: Drop your monthly myBCA PDF e-Statement or screenshot directly into the Telegram chat. Gemini 2.5 Flash extracts all incoming (`CR`) and outgoing (`DB`) rows and deduplicates them against existing email records.
+   - **Monthly myBCA e-Statement PDF / Screenshot Upload**: Drop your monthly myBCA PDF e-Statement or screenshot directly into the Telegram chat. Gemini 3.6 Flash extracts all incoming (`CR`) and outgoing (`DB`) rows and deduplicates them against existing email records.
 
 3. **Smart SQL Financial Advisor (`ai_agent.py`)**
    - Uses **Function Calling (`execute_sql_query`)** to run real SQL aggregations over your database before answering questions like:
