@@ -2,6 +2,7 @@ import hashlib
 import re
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, unquote
 
@@ -349,6 +350,184 @@ def upsert_transactions_batch(txs: List[Dict[str, Any]]) -> Dict[str, int]:
     return {
         "inserted": inserted,
         "skipped_duplicates": len(params_list) - inserted,
+    }
+
+
+_GENERIC_BANK_TOKENS = {
+    "TRSF", "EBANKING", "BIFAST", "SWITCHING", "QRIS", "KARTU", "DEBIT",
+    "PAYMENT", "TRANSFER", "INDONESIA", "JAPAN", "OVERSEAS", "STATEMENT",
+    "ENTRY", "DARI", "KEPADA", "BANK", "BCA", "MYBCA",
+}
+
+
+def _merchant_tokens(text: str) -> Set[str]:
+    words = re.findall(r"[A-Z0-9]{4,}", (text or "").upper())
+    return {w for w in words if w not in _GENERIC_BANK_TOKENS}
+
+
+def _parse_day(tx_date: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime((tx_date or "")[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _fetch_existing_candidates_in_window(
+    cur: Any,
+    start_ts: str,
+    end_ts: str,
+) -> List[Dict[str, Any]]:
+    sql = """
+    SELECT id, dedup_key, tx_date, direction, source_channel,
+           merchant_or_party, currency, amount_original, amount_idr, remarks
+    FROM transactions
+    WHERE tx_date >= {ph} AND tx_date <= {ph}
+    ORDER BY tx_date ASC, id ASC;
+    """.format(ph="%s" if IS_POSTGRES else "?")
+    cur.execute(sql, (start_ts, end_ts))
+    pool: List[Dict[str, Any]] = []
+    for row in cur.fetchall():
+        tx_date = str(_extract_col(row, 2, "tx_date") or "")
+        merchant = str(_extract_col(row, 5, "merchant_or_party") or "")
+        remarks = str(_extract_col(row, 9, "remarks") or "")
+        pool.append({
+            "id": _extract_col(row, 0, "id"),
+            "dedup_key": str(_extract_col(row, 1, "dedup_key") or ""),
+            "tx_date": tx_date,
+            "tx_day": tx_date[:10],
+            "day_dt": _parse_day(tx_date),
+            "direction": str(_extract_col(row, 3, "direction") or "OUT").upper(),
+            "source_channel": str(_extract_col(row, 4, "source_channel") or ""),
+            "merchant_or_party": merchant,
+            "currency": str(_extract_col(row, 6, "currency") or "IDR").upper(),
+            "amount_original": float(_extract_col(row, 7, "amount_original") or 0.0),
+            "amount_idr": float(_extract_col(row, 8, "amount_idr") or 0.0),
+            "tokens": _merchant_tokens(f"{merchant} {remarks}"),
+            "consumed": False,
+        })
+    return pool
+
+
+def _find_matching_existing_tx(
+    tx: Dict[str, Any],
+    pool: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    tx_day = str(tx["tx_date"])[:10]
+    tx_dt = _parse_day(tx_day)
+    tx_dir = str(tx.get("direction", "OUT")).upper()
+    tx_curr = str(tx.get("currency", "IDR")).upper()
+    tx_amt_orig = float(tx.get("amount_original") or 0.0)
+    tx_amt_idr = float(tx.get("amount_idr") or 0.0)
+    tx_tokens = _merchant_tokens(f"{tx.get('merchant_or_party', '')} {tx.get('remarks', '')}")
+
+    candidates = [r for r in pool if not r["consumed"] and r["direction"] == tx_dir]
+
+    # Pass 1: Same day + exact IDR amount (within Rp 1) + overlapping merchant token
+    for r in candidates:
+        if r["tx_day"] == tx_day and abs(r["amount_idr"] - tx_amt_idr) <= 1.0:
+            if tx_tokens and (tx_tokens & r["tokens"]):
+                return r
+
+    # Pass 2: Same day + exact IDR amount (within Rp 1)
+    for r in candidates:
+        if r["tx_day"] == tx_day and abs(r["amount_idr"] - tx_amt_idr) <= 1.0:
+            return r
+
+    # Pass 3: Foreign-currency / card settlement match within ±3 days
+    if tx_dt is not None:
+        for r in candidates:
+            if r["day_dt"] is None or abs((tx_dt - r["day_dt"]).days) > 3:
+                continue
+            if tx_curr != "IDR" and r["currency"] == tx_curr and abs(r["amount_original"] - tx_amt_orig) <= 0.01:
+                return r
+            if r["currency"] != "IDR" and tx_amt_idr > 0:
+                rel_diff = abs(r["amount_idr"] - tx_amt_idr) / max(r["amount_idr"], 1.0)
+                if rel_diff <= 0.06 and (r["tx_day"] == tx_day or bool(tx_tokens & r["tokens"])):
+                    return r
+
+    return None
+
+
+def reconcile_and_upsert_statement_transactions(txs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Reconciles transactions extracted from a myBCA e-Statement PDF or screenshot against
+    existing DB records (1-to-1 by date, direction, and amount/currency) so already-synced
+    email transactions are never duplicated, exact BCA IDR settlement amounts update foreign
+    card rows when applicable, and all new IN/OUT rows are inserted cleanly.
+    """
+    if not txs:
+        return {"inserted": 0, "skipped_duplicates": 0, "fx_updated": 0, "inserted_items": []}
+
+    init_db()
+    valid_days = [d for d in (_parse_day(str(t.get("tx_date", ""))) for t in txs) if d is not None]
+    if valid_days:
+        start_ts = (min(valid_days) - timedelta(days=3)).strftime("%Y-%m-%d") + " 00:00:00"
+        end_ts = (max(valid_days) + timedelta(days=3)).strftime("%Y-%m-%d") + " 23:59:59"
+    else:
+        start_ts = "1970-01-01 00:00:00"
+        end_ts = "9999-12-31 23:59:59"
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        pool = _fetch_existing_candidates_in_window(cur, start_ts, end_ts)
+        fx_updates: List[Tuple[float, float, Any]] = []
+        to_insert: List[Dict[str, Any]] = []
+        seen_batch_keys: Dict[str, int] = {}
+        skipped = 0
+
+        for tx in txs:
+            matched = _find_matching_existing_tx(tx, pool)
+            if matched is not None:
+                matched["consumed"] = True
+                skipped += 1
+                tx_amt_idr = float(tx.get("amount_idr") or 0.0)
+                if (
+                    matched["currency"] != "IDR"
+                    and matched["amount_original"] > 0
+                    and tx_amt_idr > 0
+                    and abs(matched["amount_idr"] - tx_amt_idr) > 1.0
+                    and tx.get("source_channel") == "e-Statement PDF"
+                ):
+                    new_fx = round(tx_amt_idr / matched["amount_original"], 4)
+                    fx_updates.append((tx_amt_idr, new_fx, matched["id"]))
+                continue
+
+            tx_day = str(tx["tx_date"])[:10]
+            tx_dir = str(tx.get("direction", "OUT")).upper()
+            tx_curr = str(tx.get("currency", "IDR")).upper()
+            tx_amt_orig = float(tx.get("amount_original") or 0.0)
+            norm_merchant = re.sub(r"[^A-Z0-9]", "", str(tx.get("merchant_or_party", "")).upper())[:20]
+            raw_sig = f"{tx_day}|{tx_dir}|{norm_merchant}|{tx_curr}|{tx_amt_orig:.2f}"
+            base_key = "hash:" + hashlib.sha256(raw_sig.encode("utf-8")).hexdigest()[:24]
+            occ = seen_batch_keys.get(base_key, 0) + 1
+            seen_batch_keys[base_key] = occ
+            tx_copy = dict(tx)
+            tx_copy["dedup_key"] = base_key if occ == 1 else f"{base_key}#{occ}"
+            to_insert.append(tx_copy)
+
+        if fx_updates:
+            upd_sql = (
+                "UPDATE transactions SET amount_idr = %s, fx_rate_to_idr = %s WHERE id = %s;"
+                if IS_POSTGRES
+                else "UPDATE transactions SET amount_idr = ?, fx_rate_to_idr = ? WHERE id = ?;"
+            )
+            for params in fx_updates:
+                cur.execute(upd_sql, params)
+
+    inserted_items: List[Dict[str, Any]] = []
+    inserted_count = 0
+    if to_insert:
+        batch_res = upsert_transactions_batch(to_insert)
+        inserted_count = batch_res["inserted"]
+        skipped += batch_res["skipped_duplicates"]
+        if inserted_count > 0:
+            inserted_items = to_insert[:inserted_count]
+
+    return {
+        "inserted": inserted_count,
+        "skipped_duplicates": skipped,
+        "fx_updated": len(fx_updates),
+        "inserted_items": inserted_items,
     }
 
 

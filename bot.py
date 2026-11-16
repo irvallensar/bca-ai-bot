@@ -29,7 +29,11 @@ from config import (
 )
 from database import init_db, run_read_only_sql
 from gmail_sync import sync_from_gmail_imap
-from statement_parser import parse_and_ingest_statement_file
+from statement_parser import (
+    detect_statement_mime_type,
+    format_statement_sync_summary,
+    parse_and_ingest_statement_file,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -197,10 +201,15 @@ async def shortcut_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📱 *iPhone Shortcuts Automation Setup*\n\n"
         f"• URL: `{endpoint}`\n"
         "• Method: `POST`\n"
-        f"• Header `Authorization`: `Bearer {token}`\n"
-        "• JSON Body (`question`): `Dictated Text` (or `Ask for Input`)\n"
-        "• Show Result -> `Get Dictionary Value` (`answer`)\n\n"
-        "💡 _Tip: Pair with Back Tap, Action Button, Control Center, or \"Hey Siri, <Shortcut Name>\"!_"
+        f"• Header `Authorization`: `{token}`\n\n"
+        "1️⃣ *Ask AI (Voice / Text):*\n"
+        "• Request Body: `JSON` (`question`: `Provided Input` / `Dictated Text`)\n"
+        "• `Get Value` for `answer` -> `Show Result`\n\n"
+        "2️⃣ *1-Tap Screenshot Sync (Incoming Money / Mutasi):*\n"
+        "• Action 1: `Take Screenshot` (while viewing myBCA Uang Masuk / Mutasi)\n"
+        "• Action 2: `Get Contents of URL` (`POST`, Header `Authorization`, Request Body: `File` -> `Screenshot`)\n"
+        "• Action 3: `Get Value` for `answer` -> `Show Result`\n\n"
+        "💡 _Tip: Pair with Back Tap, Action Button, or Control Center!_"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -259,16 +268,8 @@ async def handle_document_or_photo(update: Update, context: ContextTypes.DEFAULT
 
         file_bytes = bytes(await tg_file.download_as_bytearray())
         result = await asyncio.to_thread(parse_and_ingest_statement_file, file_bytes, mime_type)
-
-        await status_msg.edit_text(
-            f"✅ *Statement / Receipt Synced!*\n"
-            f"• Transactions detected: `{result['extracted_count']}`\n"
-            f"• New rows inserted: `{result['inserted']}`\n"
-            f"• Already in DB (skipped): `{result['skipped_duplicates']}`\n"
-            f"• New Income added: `IDR {result['new_income_idr']:,.0f}`\n"
-            f"• New Spending added: `IDR {result['new_spending_idr']:,.0f}`",
-            parse_mode="Markdown",
-        )
+        summary_md = format_statement_sync_summary(result, markdown=True)
+        await status_msg.edit_text(summary_md, parse_mode="Markdown")
     except Exception as e:
         await status_msg.edit_text(f"⚠️ Could not parse file: {e}")
 
@@ -425,10 +426,13 @@ def _extract_bearer_token(request: Request) -> str:
 
 
 @app.post("/api/ask")
+@app.post("/api/ingest")
 async def api_ask(request: Request):
     """
-    Authenticated JSON or raw-audio HTTP endpoint for iPhone Apple Shortcuts & quick automation.
+    Authenticated HTTP endpoint for iPhone Apple Shortcuts & quick automation:
     - JSON: {"question": "...", "session_id": "iphone"} (or {"action": "sync"})
+    - Raw image / PDF (Content-Type: image/*, application/pdf, or auto-detected octet-stream):
+      extracts incoming (IN) & outgoing (OUT) transactions with smart deduplication
     - Raw audio (Content-Type: audio/* or application/octet-stream): binary audio body
     """
     expected_token = _shortcut_api_token()
@@ -444,20 +448,45 @@ async def api_ask(request: Request):
 
     content_type = (request.headers.get("Content-Type") or "application/json").split(";")[0].strip().lower()
     session_id = request.query_params.get("session_id") or "default"
+    filename = request.headers.get("X-Filename") or request.headers.get("X-Audio-Filename") or ""
 
-    if content_type.startswith("audio/") or content_type == "application/octet-stream":
-        audio_bytes = await request.body()
-        if not audio_bytes:
-            raise HTTPException(status_code=400, detail="Empty audio body.")
-        if len(audio_bytes) > 20 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="Audio body exceeds 20 MB limit.")
-        filename = request.headers.get("X-Audio-Filename", "")
+    is_binary_upload = (
+        content_type.startswith("image/")
+        or content_type == "application/pdf"
+        or content_type.startswith("audio/")
+        or content_type == "application/octet-stream"
+    )
+    if is_binary_upload:
+        raw_bytes = await request.body()
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail="Empty upload body.")
+        if len(raw_bytes) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Upload body exceeds 20 MB limit.")
+
+        doc_or_img_mime = detect_statement_mime_type(raw_bytes, mime_type=content_type, filename=filename)
+        if doc_or_img_mime:
+            try:
+                result = await asyncio.to_thread(parse_and_ingest_statement_file, raw_bytes, doc_or_img_mime)
+                answer = format_statement_sync_summary(result, markdown=False)
+                if telegram_app and ALLOWED_TELEGRAM_USER_IDS:
+                    try:
+                        await telegram_app.bot.send_message(
+                            chat_id=ALLOWED_TELEGRAM_USER_IDS[0],
+                            text=f"📱 *Synced via iPhone Shortcut*\n\n{format_statement_sync_summary(result, markdown=True)}",
+                            parse_mode="Markdown",
+                        )
+                    except Exception as notify_err:
+                        logger.warning("Optional Telegram shortcut notification skipped: %s", notify_err)
+                return {"ok": True, "action": "ingest", "result": result, "answer": answer}
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
         history_key = f"shortcut:{session_id}"
         history = list(USER_HISTORY.get(history_key, []))
         try:
             result = await asyncio.to_thread(
                 answer_audio_question,
-                audio_bytes,
+                raw_bytes,
                 "audio/mp4" if content_type == "application/octet-stream" and not filename else content_type,
                 history,
                 filename,
