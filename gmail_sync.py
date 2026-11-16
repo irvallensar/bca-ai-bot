@@ -162,8 +162,9 @@ def _parse_raw_email_message(raw_bytes: bytes) -> Optional[Dict[str, Any]]:
 def sync_from_gmail_imap(max_messages_per_sender: Optional[int] = None) -> Dict[str, int]:
     """
     Connects to Gmail IMAP using GMAIL_ADDRESS + GMAIL_APP_PASSWORD,
-    fetches emails from `bca@bca.co.id` and `PasporBCA@klikbca.com`
-    (all matching emails when `max_messages_per_sender` is None),
+    fetches emails from `bca@bca.co.id`, `PasporBCA@klikbca.com`, and
+    Google Play / Google Payments receipts (`googleplay-noreply@google.com`,
+    `payments-noreply@google.com`, `noreply@google.com`),
     skips emails whose Message-ID is already stored, parses new ones,
     and batch-inserts new transactions into the database.
     """
@@ -184,6 +185,9 @@ def sync_from_gmail_imap(max_messages_per_sender: Optional[int] = None) -> Dict[
         queries = [
             '(FROM "bca@bca.co.id")',
             '(FROM "PasporBCA@klikbca.com")',
+            '(FROM "googleplay-noreply@google.com" SUBJECT "Receipt")',
+            '(FROM "payments-noreply@google.com" BODY "Order number")',
+            '(FROM "noreply@google.com" SUBJECT "Receipt")',
         ]
 
         candidate_nums: List[bytes] = []

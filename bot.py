@@ -87,7 +87,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• 🎙 *Send a voice recording / audio note* to ask questions or log expenses hands-free!\n\n"
         "🛠 *Commands:*\n"
         "`/summary` — Current month spending & income summary\n"
-        "`/sync` — Pull all BCA & PasporBCA emails from Gmail\n"
+        "`/sync` — Pull BCA, PasporBCA & Google receipt emails from Gmail\n"
         "`/shortcut` — iPhone Shortcuts quick automation setup\n"
         "`/clear` — Reset chat memory"
     )
@@ -148,7 +148,9 @@ async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except ValueError:
             pass
 
-    status_msg = await update.message.reply_text("🔄 Syncing BCA & PasporBCA emails from Gmail...(this may take a while)")
+    status_msg = await update.message.reply_text(
+        "🔄 Syncing BCA, PasporBCA & Google receipt emails from Gmail...(this may take a while)"
+    )
     try:
         async with SYNC_LOCK:
             stats = await asyncio.to_thread(sync_from_gmail_imap, limit)

@@ -47,6 +47,9 @@ def sync_via_local_gmail_cli(max_per_sender: int = 50) -> Dict[str, int]:
     queries = [
         "from:bca@bca.co.id",
         "from:PasporBCA@klikbca.com",
+        "from:googleplay-noreply@google.com subject:Receipt",
+        'from:payments-noreply@google.com "Order number"',
+        "from:noreply@google.com subject:Receipt",
     ]
 
     for q in queries:

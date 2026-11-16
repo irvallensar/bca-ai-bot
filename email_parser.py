@@ -1,9 +1,39 @@
 import html
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from config import DEFAULT_FX_RATES_TO_IDR
+
+WIB_TZ = timezone(timedelta(hours=7))
+
+_TZ_OFFSETS_HOURS = {
+    "UTC": 0.0,
+    "GMT": 0.0,
+    "WIB": 7.0,
+    "WITA": 8.0,
+    "WIT": 9.0,
+    "SGT": 8.0,
+    "JST": 9.0,
+    "PDT": -7.0,
+    "PST": -8.0,
+    "EDT": -4.0,
+    "EST": -5.0,
+    "CDT": -5.0,
+    "CST": -6.0,
+}
+
+_CURRENCY_SYMBOLS = (
+    ("US$", "USD"),
+    ("S$", "SGD"),
+    ("RP.", "IDR"),
+    ("RP", "IDR"),
+    ("RM", "MYR"),
+    ("￥", "JPY"),
+    ("¥", "JPY"),
+    ("$", "USD"),
+    ("€", "EUR"),
+)
 
 # Keyword-based auto-categorizer aligned with myBCA Financial Diary categories
 CATEGORY_KEYWORDS = {
@@ -27,7 +57,7 @@ CATEGORY_KEYWORDS = {
         "UNIQLO", "GU ", "DON QUIJOTE", "DONQUIJOTE", "DONKI", "DAISO", "MUJI", "ZARA",
         "H&M", "ABC-MART", "YODOBASHI", "BIC CAMERA", "MATSUMOTO KIYOSHI",
         "WELCIA", "SUNDRUG", "TOKOPEDIA", "SHOPEE", "LAZADA", "BLIBLI",
-        "TIKTOK SHOP", "AMAZON", "MERCARI", "IKEA", "NITORI", "GRAMEDIA",
+        "TIKTOK SHOP", "AMAZON", "MERCARI", "IKEA", "NITORI", "GRAMEDIA", "DIGITAL BOOK",
     ],
     "Groceries": [
         "MIDI REGULER", "ALFAMIDI", "ALFAMART", "INDOMARET", "SEVEN-ELEVEN",
@@ -39,7 +69,9 @@ CATEGORY_KEYWORDS = {
     "Bills & Utilities": [
         "TELKOMSEL", "MY TELKOMSEL", "FINNET", "XL", "INDOSAT", "SMARTFREN",
         "BIZNET", "INDIHOME", "FIRST MEDIA", "PLN", "LISTRIK", "PDAM", "BPJS",
-        "NETFLIX", "SPOTIFY", "APPLE.COM/BILL", "GOOGLE*", "YOUTUBE", "OPENAI",
+        "NETFLIX", "SPOTIFY", "APPLE.COM/BILL", "GOOGLE*", "GOOGLE ONE", "GOOGLE AI",
+        "GOOGLE DIGITAL", "GOOGLE CLOUD", "GOOGLE COLAB", "COLAB COMPUTE",
+        "AUTO-RENEWING SUBSCRIPTION", "YOUTUBE", "OPENAI",
         "SOFTBANK", "DOCOMO", "AU KDDI", "TOKYO ELECTRIC", "TOKYO GAS",
     ],
     "Cash Withdrawal": [
@@ -60,7 +92,13 @@ def guess_category(merchant: str, tx_type: str, remarks: str = "") -> str:
 
     for category, keywords in CATEGORY_KEYWORDS.items():
         for kw in keywords:
-            if kw in combined:
+            token = kw.strip()
+            matched = (
+                bool(re.search(rf"\b{re.escape(token)}\b", combined))
+                if len(token) <= 3
+                else kw in combined
+            )
+            if matched:
                 return category
 
     if "TRANSFER TO BCA ACCOUNT" in tx_type.upper() or "TRANSFER" in tx_type.upper():
@@ -71,8 +109,9 @@ def guess_category(merchant: str, tx_type: str, remarks: str = "") -> str:
 
 
 def html_to_lines(raw_body: str) -> list[str]:
-    """Strips HTML tags, unescapes entities, and returns non-empty normalized lines."""
-    clean = re.sub(r"<[^>]+>", "\n", raw_body)
+    """Strips style/script blocks and HTML tags, returning normalized non-empty lines."""
+    clean = re.sub(r"<(style|script)\b[^>]*>.*?</\1>", "\n", raw_body, flags=re.IGNORECASE | re.DOTALL)
+    clean = re.sub(r"<[^>]+>", "\n", clean)
     clean = html.unescape(clean)
     lines = []
     for line in clean.splitlines():
@@ -125,35 +164,45 @@ def extract_kv_pairs(lines: list[str]) -> Dict[str, str]:
     return kv
 
 
+def _split_currency_and_number(raw_val: str) -> tuple[str, str]:
+    s = re.sub(r"\s*/\s*(month|year|week|day|mo|yr|bulan|tahun)\b.*$", "", raw_val.strip(), flags=re.IGNORECASE).strip()
+    iso_match = re.match(r"^([A-Z]{3})(?=\s|\d)(.+)$", s)
+    if iso_match:
+        return iso_match.group(1).upper(), re.sub(r"[^0-9.,]", "", iso_match.group(2))
+
+    s_upper = s.upper()
+    for sym, code in _CURRENCY_SYMBOLS:
+        if s_upper.startswith(sym.upper()):
+            rest = s[len(sym):]
+            return code, re.sub(r"[^0-9.,]", "", rest)
+
+    return "IDR", re.sub(r"[^0-9.,]", "", s)
+
+
 def parse_amount_and_currency(raw_val: str) -> tuple[str, float]:
     """
-    Parses strings like:
+    Parses amount strings across BCA, PasporBCA, and Google Play/Payments formats:
     - 'IDR 45,000.00' -> ('IDR', 45000.0)
+    - 'Rp 72.221,00'   -> ('IDR', 72221.0)
     - 'JPY 1.962'     -> ('JPY', 1962.0)  [PasporBCA uses dot as thousand separator!]
-    - 'JPY 20.000'    -> ('JPY', 20000.0)
+    - '￥720/month'   -> ('JPY', 720.0)
     """
     if not raw_val:
         return ("IDR", 0.0)
-    s = raw_val.strip()
-    m = re.match(r"^([A-Z]{3})\s*(.+)$", s)
-    if m:
-        curr = m.group(1).upper()
-        num_str = m.group(2).strip()
-    else:
-        curr = "IDR"
-        num_str = re.sub(r"[^0-9.,]", "", s)
+    curr, num_str = _split_currency_and_number(raw_val)
+    if not num_str:
+        return (curr, 0.0)
 
-    # Handle Indonesian dot thousands format in PasporBCA (e.g. '1.962' or '20.000' without comma)
     if "," in num_str and "." in num_str:
-        # e.g. '45,000.00' -> remove commas
-        num_str = num_str.replace(",", "")
-    elif "." in num_str and "," not in num_str:
-        # Check if dot is thousand separator (e.g. '1.450', '20.000')
+        if num_str.rfind(",") > num_str.rfind("."):
+            num_str = num_str.replace(".", "").replace(",", ".")
+        else:
+            num_str = num_str.replace(",", "")
+    elif "." in num_str:
         parts = num_str.split(".")
         if len(parts[-1]) == 3:
             num_str = num_str.replace(".", "")
-    elif "," in num_str and "." not in num_str:
-        # e.g. '45.000,00' or '45,000'
+    elif "," in num_str:
         parts = num_str.split(",")
         if len(parts[-1]) == 3:
             num_str = num_str.replace(",", "")
@@ -165,6 +214,213 @@ def parse_amount_and_currency(raw_val: str) -> tuple[str, float]:
     except ValueError:
         amount = 0.0
     return curr, amount
+
+
+def _normalize_google_tx_date(raw_date: str, fallback_iso: Optional[str] = None) -> str:
+    """
+    Normalizes Google Play/Payments timestamps (e.g. 'Oct 20, 2026 10:07:43 PM GMT+9'
+    or 'March 9, 2026 at 6:53:53 AM PDT') into WIB ('YYYY-MM-DD HH:MM:SS').
+    """
+    s = re.sub(r"\s+", " ", (raw_date or "")).strip()
+    s = re.sub(r"\s+at\s+", " ", s, flags=re.IGNORECASE)
+    tz_offset_hours: Optional[float] = None
+
+    offset_match = re.search(r"\b(?:GMT|UTC)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?\s*$", s, flags=re.IGNORECASE)
+    if offset_match:
+        sign = 1.0 if offset_match.group(1) == "+" else -1.0
+        hours = int(offset_match.group(2))
+        mins = int(offset_match.group(3) or 0)
+        tz_offset_hours = sign * (hours + mins / 60.0)
+        s = s[: offset_match.start()].strip()
+    else:
+        abbr_match = re.search(r"\b([A-Z]{2,4})\s*$", s)
+        if abbr_match and abbr_match.group(1) in _TZ_OFFSETS_HOURS:
+            tz_offset_hours = _TZ_OFFSETS_HOURS[abbr_match.group(1)]
+            s = s[: abbr_match.start()].strip()
+
+    for fmt in (
+        "%b %d, %Y %I:%M:%S %p",
+        "%B %d, %Y %I:%M:%S %p",
+        "%b %d, %Y %I:%M %p",
+        "%B %d, %Y %I:%M %p",
+        "%b %d, %Y %H:%M:%S",
+        "%B %d, %Y %H:%M:%S",
+        "%b %d, %Y",
+        "%B %d, %Y",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if tz_offset_hours is not None:
+                dt = dt.replace(tzinfo=timezone(timedelta(hours=tz_offset_hours))).astimezone(WIB_TZ)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+
+    return normalize_tx_date(raw_date, fallback_iso)
+
+
+def _extract_labeled_line_value(
+    lines: list[str],
+    label: str,
+    require_digit: bool = False,
+    last_match: bool = False,
+) -> str:
+    pattern = re.compile(rf"^{re.escape(label)}\b\s*:?\s*(.*)$", re.IGNORECASE)
+    matches: list[str] = []
+    n = len(lines)
+    for i, line in enumerate(lines):
+        m = pattern.match(line)
+        if not m:
+            continue
+        val = m.group(1).strip()
+        if not val and i + 1 < n:
+            nxt = lines[i + 1].strip()
+            if nxt == ":" and i + 2 < n:
+                val = lines[i + 2].strip()
+            elif nxt.startswith(":"):
+                val = nxt[1:].strip() or (lines[i + 2].strip() if i + 2 < n else "")
+            else:
+                val = nxt
+        if val and (not require_digit or re.search(r"\d", val)):
+            matches.append(val)
+    if not matches:
+        return ""
+    return matches[-1] if last_match else matches[0]
+
+
+def _extract_google_item_name(lines: list[str], source_label: str, service_hint: str = "") -> str:
+    item = ""
+    for i, line in enumerate(lines):
+        if re.match(r"^Item(?:\s+(?:Quantity\s+)?Price)?$", line, flags=re.IGNORECASE):
+            for candidate in lines[i + 1 : i + 6]:
+                low = candidate.lower()
+                if low in ("quantity", "price"):
+                    continue
+                if re.match(r"^(total|tax|consumption tax|subtotal|payment method)\b", low):
+                    break
+                if re.match(
+                    r"^(?:[\d.,]+|(?:Rp\.?|IDR|JPY|USD|US\$|SGD|S\$|EUR|MYR|RM|[￥¥$€])\s*[\d.,]+(?:/[A-Za-z]+)?)$",
+                    low,
+                    flags=re.IGNORECASE,
+                ):
+                    continue
+                item = candidate
+                break
+            if item:
+                break
+
+    if item:
+        item = re.sub(
+            r"\s+(?:Rp\.?|IDR|JPY|USD|US\$|SGD|S\$|EUR|MYR|RM|[￥¥$€])\s*[\d.,]+(?:/[A-Za-z]+)?\s*$",
+            "",
+            item,
+            flags=re.IGNORECASE,
+        ).strip()
+        item = re.sub(r"\s*\(by [^)]+\)\s*$", "", item, flags=re.IGNORECASE).strip()
+
+    if not item:
+        item = service_hint or source_label
+    if "google" not in item.lower():
+        prefix = f"Google {service_hint}" if service_hint and service_hint.lower() not in item.lower() else source_label
+        item = f"{prefix} - {item}"
+    return item
+
+
+def _is_google_receipt_candidate(sender: str, subject: str) -> bool:
+    sender_low = sender.lower()
+    subject_low = subject.lower()
+    return (
+        "@google.com" in sender_low
+        or "google play" in sender_low
+        or "google payments" in sender_low
+        or "google play order receipt" in subject_low
+    )
+
+
+def parse_google_receipt_email(
+    lines: list[str],
+    subject: str = "",
+    sender: str = "",
+    email_message_id: Optional[str] = None,
+    fallback_date_iso: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Parses positive-charge Google Play (`googleplay-noreply@google.com` / `noreply@google.com`)
+    and Google Payments (`payments-noreply@google.com`) order receipt emails.
+    Returns None for $0 trials, ToS updates, verification codes, refunds, or non-receipts.
+    """
+    joined_low = " ".join(lines).lower()
+    subject_low = subject.lower()
+    if any(tok in subject_low for tok in ("refund", "canceled", "cancelled")) or "been refunded" in joined_low:
+        return None
+
+    order_no = _extract_labeled_line_value(lines, "Order number")
+    if not order_no:
+        return None
+
+    raw_total = _extract_labeled_line_value(lines, "Total", require_digit=True, last_match=True)
+    curr, amt = parse_amount_and_currency(raw_total)
+    if amt <= 0:
+        return None
+
+    raw_date = _extract_labeled_line_value(lines, "Order date", require_digit=True)
+    service_hint = ""
+    if not raw_date:
+        date_pat = re.compile(
+            r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+\d{4}(?:\s+at)?\s+\d{1,2}:\d{2}",
+            re.IGNORECASE,
+        )
+        for idx, line in enumerate(lines):
+            if date_pat.match(line):
+                raw_date = line
+                if idx > 0 and len(lines[idx - 1]) < 40 and not lines[idx - 1].startswith("–"):
+                    service_hint = lines[idx - 1].strip()
+                break
+
+    tx_date = _normalize_google_tx_date(raw_date, fallback_date_iso)
+
+    sender_low = sender.lower()
+    is_play = "google play" in sender_low or "google play" in subject_low or "google play" in joined_low
+    source_channel = "Google Play Email" if is_play else "Google Payments Email"
+    source_label = "Google Play" if is_play else "Google"
+
+    merchant = _extract_google_item_name(lines, source_label=source_label, service_hint=service_hint)
+
+    raw_pm = _extract_labeled_line_value(lines, "Payment method")
+    payment_method = re.sub(r"\s*(?:[•●]\s*)+", "-", raw_pm).strip() if raw_pm else None
+
+    if "auto-renewing subscription" in joined_low or re.search(r"/\s*(?:month|year|week)\b", raw_total, flags=re.IGNORECASE):
+        tx_type = "Auto-renewing Subscription"
+    elif "digital book" in joined_low:
+        tx_type = "Digital Book Purchase"
+    else:
+        tx_type = "Google Play Purchase" if is_play else "Google Payments Purchase"
+
+    fx = DEFAULT_FX_RATES_TO_IDR.get(curr, 1.0)
+    country = "JAPAN" if curr == "JPY" else "INDONESIA"
+    remarks = f"Google Order {order_no}" + (f" ({payment_method})" if payment_method else "")
+    category = guess_category(merchant, tx_type, remarks)
+
+    return {
+        "email_message_id": email_message_id,
+        "reference_no": order_no,
+        "tx_date": tx_date,
+        "direction": "OUT",
+        "source_channel": source_channel,
+        "tx_type": tx_type,
+        "merchant_or_party": merchant,
+        "beneficiary_account": None,
+        "location": country,
+        "country": country,
+        "category": category,
+        "currency": curr,
+        "amount_original": amt,
+        "fx_rate_to_idr": fx,
+        "amount_idr": round(amt * fx, 2),
+        "source_of_fund": payment_method,
+        "remarks": remarks,
+        "raw_excerpt": f"Order: {order_no} | Item: {merchant} | Total: {raw_total} | PM: {payment_method or '-'}",
+    }
 
 
 def normalize_tx_date(raw_date: str, fallback_iso: Optional[str] = None) -> str:
@@ -194,11 +450,20 @@ def parse_bca_email(
     fallback_date_iso: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Parses any transaction email from `bca@bca.co.id` or `PasporBCA@klikbca.com`
-    into a normalized dictionary ready for `upsert_transaction()`.
+    Parses transaction emails from BCA (`bca@bca.co.id`), PasporBCA (`PasporBCA@klikbca.com`),
+    and Google Play / Google Payments receipts into a normalized dictionary for `upsert_transaction()`.
     Returns None if the email is promotional/non-transactional.
     """
     lines = html_to_lines(raw_html_or_text)
+    if _is_google_receipt_candidate(sender, subject):
+        return parse_google_receipt_email(
+            lines,
+            subject=subject,
+            sender=sender,
+            email_message_id=email_message_id,
+            fallback_date_iso=fallback_date_iso,
+        )
+
     kv = extract_kv_pairs(lines)
     if not kv:
         return None
