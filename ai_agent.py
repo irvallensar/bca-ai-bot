@@ -1,8 +1,9 @@
 import json
 import re
+import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from google import genai
 from google.genai import types
@@ -14,13 +15,21 @@ from config import (
     GEMINI_MODEL,
     MYBCA_CATEGORIES,
 )
+import database
 from database import (
     IS_POSTGRES,
+    fetch_financial_snapshot,
+    get_db_mutation_version,
     init_db,
     run_read_only_sql,
     set_merchant_category_rule,
     upsert_transaction,
 )
+
+_SNAPSHOT_CACHE: Optional[Tuple[Tuple[Any, ...], str]] = None
+_CLIENT_CACHE: Dict[Tuple[int, str, int], Any] = {}
+_LAST_WORKING_MODEL: Optional[str] = None
+_LAST_WORKING_TS: float = 0.0
 
 
 def execute_sql_query(sql_query: str) -> str:
@@ -130,63 +139,26 @@ def recategorize_merchant(merchant_pattern: str, new_category: str) -> str:
 
 def get_financial_context_block() -> str:
     """
-    Pre-fetches a compact SQL summary (monthly totals, category/merchant aggregates,
-    and latest transactions) so most questions finish in a single API call with exact
-    SQL numbers, conserving free-tier RPM/RPD quota.
+    Pre-fetches a compact SQL summary in a single DB connection and caches it in memory
+    (invalidated immediately on DB writes or after 60s) so repeat questions need 0 DB
+    round-trips and finish in a single fast Gemini call.
     """
+    global _SNAPSHOT_CACHE
     try:
-        total_rows = run_read_only_sql("SELECT COUNT(*) AS cnt FROM transactions;")[0]["cnt"]
-        monthly_totals = run_read_only_sql(
-            """
-            SELECT tx_month, direction, country, currency,
-                   COUNT(*) AS tx_count,
-                   SUM(amount_original) AS total_orig,
-                   ROUND(SUM(amount_idr)) AS total_idr
-            FROM transactions
-            GROUP BY tx_month, direction, country, currency
-            ORDER BY tx_month DESC, total_idr DESC
-            LIMIT 100;
-            """
+        cache_key = (database.DATABASE_URL, get_db_mutation_version(), int(time.monotonic() // 60))
+        if _SNAPSHOT_CACHE is not None and _SNAPSHOT_CACHE[0] == cache_key:
+            return _SNAPSHOT_CACHE[1]
+
+        snap = fetch_financial_snapshot()
+        block = (
+            f"Total DB transactions: {snap['total_rows']}\n"
+            f"Monthly Totals by Country/Currency (recent 28 groups): {json.dumps(snap['monthly_totals'])}\n"
+            f"Monthly Totals by Category (recent 40 groups): {json.dumps(snap['category_totals'])}\n"
+            f"Category & Merchant Breakdown (top 40 groups): {json.dumps(snap['merchant_breakdown'])}\n"
+            f"Latest 25 Transactions: {json.dumps(snap['recent_tx'])}"
         )
-        category_totals = run_read_only_sql(
-            """
-            SELECT tx_month, direction, category,
-                   COUNT(*) AS tx_count,
-                   ROUND(SUM(amount_idr)) AS total_idr
-            FROM transactions
-            GROUP BY tx_month, direction, category
-            ORDER BY tx_month DESC, total_idr DESC
-            LIMIT 120;
-            """
-        )
-        merchant_breakdown = run_read_only_sql(
-            """
-            SELECT tx_month, direction, country, category, merchant_or_party, currency,
-                   COUNT(*) AS tx_count,
-                   SUM(amount_original) AS total_orig,
-                   ROUND(SUM(amount_idr)) AS total_idr
-            FROM transactions
-            GROUP BY tx_month, direction, country, category, merchant_or_party, currency
-            ORDER BY tx_month DESC, total_idr DESC
-            LIMIT 120;
-            """
-        )
-        recent_tx = run_read_only_sql(
-            """
-            SELECT tx_date, direction, country, category, merchant_or_party, currency,
-                   amount_original, amount_idr, remarks
-            FROM transactions
-            ORDER BY tx_date DESC
-            LIMIT 30;
-            """
-        )
-        return (
-            f"Total DB transactions: {total_rows}\n"
-            f"Monthly Totals by Country/Currency: {json.dumps(monthly_totals)}\n"
-            f"Monthly Totals by Category: {json.dumps(category_totals)}\n"
-            f"Category & Merchant Breakdown (top 120 groups): {json.dumps(merchant_breakdown)}\n"
-            f"Latest 30 Transactions: {json.dumps(recent_tx)}"
-        )
+        _SNAPSHOT_CACHE = (cache_key, block)
+        return block
     except Exception:
         return "Database snapshot unavailable; use execute_sql_query."
 
@@ -209,6 +181,24 @@ def strip_markdown_syntax(text: str) -> str:
     return cleaned.strip()
 
 
+def _get_genai_client(timeout_ms: int = 18000) -> Any:
+    """Reuses a warm Gemini HTTP client pool unless `genai.Client` is mocked in tests."""
+    key = (id(genai.Client), GEMINI_API_KEY, timeout_ms)
+    client = _CLIENT_CACHE.get(key)
+    if client is None:
+        client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=timeout_ms))
+        if len(_CLIENT_CACHE) > 8:
+            _CLIENT_CACHE.clear()
+        _CLIENT_CACHE[key] = client
+    return client
+
+
+def _record_working_model(model_name: str) -> None:
+    global _LAST_WORKING_MODEL, _LAST_WORKING_TS
+    _LAST_WORKING_MODEL = model_name
+    _LAST_WORKING_TS = time.monotonic()
+
+
 def _model_candidates() -> List[str]:
     seen = set()
     ordered = []
@@ -216,6 +206,13 @@ def _model_candidates() -> List[str]:
         if m and m not in seen:
             seen.add(m)
             ordered.append(m)
+    if (
+        _LAST_WORKING_MODEL
+        and _LAST_WORKING_MODEL in ordered
+        and (time.monotonic() - _LAST_WORKING_TS) < 900.0
+    ):
+        ordered.remove(_LAST_WORKING_MODEL)
+        ordered.insert(0, _LAST_WORKING_MODEL)
     return ordered
 
 
@@ -223,7 +220,23 @@ def _is_retryable_model_error(err: Exception) -> bool:
     msg = str(err).upper()
     return any(
         token in msg
-        for token in ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND", "TIMEOUT", "READTIMEOUT", "503", "UNAVAILABLE")
+        for token in (
+            "429",
+            "RESOURCE_EXHAUSTED",
+            "404",
+            "NOT_FOUND",
+            "TIMEOUT",
+            "READTIMEOUT",
+            "DEADLINE_EXCEEDED",
+            "500",
+            "502",
+            "503",
+            "504",
+            "UNAVAILABLE",
+            "INTERNAL",
+            "SERVERERROR",
+            "OVERLOADED",
+        )
     )
 
 
@@ -280,7 +293,7 @@ def transcribe_audio_with_gemini(
         raise ValueError("Audio recording is empty.")
 
     clean_mime = normalize_audio_mime_type(mime_type, filename=filename)
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=45000))
+    client = _get_genai_client(timeout_ms=25000)
     prompt = (
         "Transcribe this spoken audio verbatim in its original language (Indonesian or English), "
         "preserving numbers, currency amounts, dates, and merchant names. "
@@ -304,6 +317,7 @@ def transcribe_audio_with_gemini(
             transcript = strip_markdown_syntax(response.text or "")
             if not transcript:
                 raise ValueError("Could not detect clear speech in the audio recording.")
+            _record_working_model(model_name)
             return transcript
         except ValueError:
             raise
@@ -365,7 +379,7 @@ Core Guidelines:
 5. Formatting: Output clean PLAIN TEXT only. Do NOT use Markdown syntax (`**`, `*`, `#`, `###`, `---`, backticks, or Markdown tables). Instead, use clean line breaks, emoji/plain-text section headers, and `•` Unicode bullets for lists, keeping responses under 3,500 characters.
 """
 
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=45000))
+    client = _get_genai_client(timeout_ms=18000)
     history = []
     if chat_history:
         for msg in chat_history[-6:]:
@@ -376,7 +390,7 @@ Core Guidelines:
         system_instruction=system_instruction,
         tools=[execute_sql_query, log_manual_transaction, recategorize_merchant],
         thinking_config=types.ThinkingConfig(thinking_level="LOW"),
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=4),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=2),
         temperature=0.1,
     )
 
@@ -386,6 +400,7 @@ Core Guidelines:
             chat = client.chats.create(model=model_name, config=config, history=history or None)
             response = chat.send_message(user_question)
             raw_text = response.text or "I processed your request, but no text response was generated."
+            _record_working_model(model_name)
             return strip_markdown_syntax(raw_text)
         except Exception as e:
             last_err = e

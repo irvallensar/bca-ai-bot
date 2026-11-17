@@ -480,6 +480,9 @@ async def api_ask(request: Request):
                 return {"ok": True, "action": "ingest", "result": result, "answer": answer}
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                logger.exception("Shortcut document/image ingest error")
+                return {"ok": False, "error": str(e), "answer": f"⚠️ Could not process screenshot/file: {e}"}
 
         history_key = f"shortcut:{session_id}"
         history = list(USER_HISTORY.get(history_key, []))
@@ -495,6 +498,9 @@ async def api_ask(request: Request):
             return {"ok": True, "transcript": result["transcript"], "answer": result["answer"]}
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.exception("Shortcut audio processing error")
+            return {"ok": False, "error": str(e), "answer": f"⚠️ Could not process audio: {e}"}
 
     try:
         payload = await request.json()
@@ -510,21 +516,29 @@ async def api_ask(request: Request):
     question = str(payload.get("question") or "").strip()
 
     if action == "sync" or question.lower() == "/sync":
-        async with SYNC_LOCK:
-            stats = await asyncio.to_thread(sync_from_gmail_imap, None)
-        answer = (
-            f"Gmail Sync Complete: scanned {stats['scanned']} emails, "
-            f"added {stats['inserted']} new transactions, skipped {stats['skipped_duplicates']} duplicates."
-        )
-        return {"ok": True, "action": "sync", "stats": stats, "answer": answer}
+        try:
+            async with SYNC_LOCK:
+                stats = await asyncio.to_thread(sync_from_gmail_imap, None)
+            answer = (
+                f"Gmail Sync Complete: scanned {stats['scanned']} emails, "
+                f"added {stats['inserted']} new transactions, skipped {stats['skipped_duplicates']} duplicates."
+            )
+            return {"ok": True, "action": "sync", "stats": stats, "answer": answer}
+        except Exception as e:
+            logger.exception("Shortcut sync error")
+            return {"ok": False, "error": str(e), "answer": f"⚠️ Gmail sync error: {e}"}
 
     if not question:
         raise HTTPException(status_code=400, detail="Missing 'question' in JSON body.")
 
     history = list(USER_HISTORY.get(history_key, []))
-    answer = await asyncio.to_thread(ask_financial_ai, question, history)
-    _append_history(history_key, question, answer)
-    return {"ok": True, "question": question, "answer": answer}
+    try:
+        answer = await asyncio.to_thread(ask_financial_ai, question, history)
+        _append_history(history_key, question, answer)
+        return {"ok": True, "question": question, "answer": answer}
+    except Exception as e:
+        logger.exception("Shortcut ask_financial_ai error")
+        return {"ok": False, "question": question, "error": str(e), "answer": f"⚠️ Temporary AI error: {e}"}
 
 
 @app.get("/")

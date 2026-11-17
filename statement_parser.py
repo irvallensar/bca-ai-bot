@@ -169,7 +169,25 @@ def parse_and_ingest_statement_file(file_bytes: bytes, mime_type: str = "applica
         except Exception as e:
             last_err = e
             msg = str(e).upper()
-            if any(t in msg for t in ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND", "TIMEOUT", "503")):
+            if any(
+                t in msg
+                for t in (
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "404",
+                    "NOT_FOUND",
+                    "TIMEOUT",
+                    "READTIMEOUT",
+                    "DEADLINE_EXCEEDED",
+                    "500",
+                    "502",
+                    "503",
+                    "504",
+                    "UNAVAILABLE",
+                    "INTERNAL",
+                    "SERVERERROR",
+                )
+            ):
                 continue
             raise
 

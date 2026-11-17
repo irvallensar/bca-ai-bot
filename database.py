@@ -16,9 +16,14 @@ if IS_POSTGRES:
 
 _RESOLVED_POSTGRES_URL: Optional[str] = None
 _INITIALIZED_DB_URL: Optional[str] = None
+_DB_MUTATION_VERSION: int = 0
 _POSTGRES_URI_RE = re.compile(
     r"^(postgres(?:ql)?)://(.+)@((?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(?::\d+)?)([/?#].*)?$"
 )
+
+
+def get_db_mutation_version() -> int:
+    return _DB_MUTATION_VERSION
 
 
 def _encode_pg_password(pw: str) -> str:
@@ -347,6 +352,10 @@ def upsert_transactions_batch(txs: List[Dict[str, Any]]) -> Dict[str, int]:
             cur.executemany(sql, params_list)
             inserted = conn.total_changes - before
 
+    if inserted > 0:
+        global _DB_MUTATION_VERSION
+        _DB_MUTATION_VERSION += 1
+
     return {
         "inserted": inserted,
         "skipped_duplicates": len(params_list) - inserted,
@@ -513,6 +522,8 @@ def reconcile_and_upsert_statement_transactions(txs: List[Dict[str, Any]]) -> Di
             )
             for params in fx_updates:
                 cur.execute(upd_sql, params)
+            global _DB_MUTATION_VERSION
+            _DB_MUTATION_VERSION += 1
 
     inserted_items: List[Dict[str, Any]] = []
     inserted_count = 0
@@ -577,7 +588,93 @@ def set_merchant_category_rule(merchant_pattern: str, category: str, notes: str 
                 "UPDATE transactions SET category = ? WHERE UPPER(merchant_or_party) LIKE ?;",
                 (category, f"%{pattern_clean}%"),
             )
+        global _DB_MUTATION_VERSION
+        _DB_MUTATION_VERSION += 1
         return cur.rowcount
+
+
+def _query_dicts_on_cursor(cur: Any, sql: str) -> List[Dict[str, Any]]:
+    cur.execute(sql)
+    rows = cur.fetchall()
+    if not rows:
+        return []
+    if isinstance(rows[0], dict):
+        return list(rows)
+    cols = [col[0] for col in cur.description] if cur.description else []
+    return [dict(zip(cols, row)) for row in rows]
+
+
+def fetch_financial_snapshot() -> Dict[str, Any]:
+    """
+    Fetches the AI advisor's summary snapshot in a single database connection
+    (avoiding 5 sequential TCP/TLS handshakes to Supabase).
+    """
+    with get_connection() as conn:
+        if IS_POSTGRES:
+            with conn.cursor(row_factory=dict_row) as cur:
+                return _build_snapshot_from_cursor(cur)
+        cur = conn.cursor()
+        return _build_snapshot_from_cursor(cur)
+
+
+def _build_snapshot_from_cursor(cur: Any) -> Dict[str, Any]:
+    cnt_rows = _query_dicts_on_cursor(cur, "SELECT COUNT(*) AS cnt FROM transactions;")
+    total_rows = cnt_rows[0]["cnt"] if cnt_rows else 0
+    monthly_totals = _query_dicts_on_cursor(
+        cur,
+        """
+        SELECT tx_month, direction, country, currency,
+               COUNT(*) AS tx_count,
+               SUM(amount_original) AS total_orig,
+               ROUND(SUM(amount_idr)) AS total_idr
+        FROM transactions
+        GROUP BY tx_month, direction, country, currency
+        ORDER BY tx_month DESC, total_idr DESC
+        LIMIT 28;
+        """,
+    )
+    category_totals = _query_dicts_on_cursor(
+        cur,
+        """
+        SELECT tx_month, direction, category,
+               COUNT(*) AS tx_count,
+               ROUND(SUM(amount_idr)) AS total_idr
+        FROM transactions
+        GROUP BY tx_month, direction, category
+        ORDER BY tx_month DESC, total_idr DESC
+        LIMIT 40;
+        """,
+    )
+    merchant_breakdown = _query_dicts_on_cursor(
+        cur,
+        """
+        SELECT tx_month, direction, country, category, merchant_or_party, currency,
+               COUNT(*) AS tx_count,
+               SUM(amount_original) AS total_orig,
+               ROUND(SUM(amount_idr)) AS total_idr
+        FROM transactions
+        GROUP BY tx_month, direction, country, category, merchant_or_party, currency
+        ORDER BY tx_month DESC, total_idr DESC
+        LIMIT 40;
+        """,
+    )
+    recent_tx = _query_dicts_on_cursor(
+        cur,
+        """
+        SELECT tx_date, direction, country, category, merchant_or_party, currency,
+               amount_original, amount_idr, remarks
+        FROM transactions
+        ORDER BY tx_date DESC
+        LIMIT 25;
+        """,
+    )
+    return {
+        "total_rows": total_rows,
+        "monthly_totals": monthly_totals,
+        "category_totals": category_totals,
+        "merchant_breakdown": merchant_breakdown,
+        "recent_tx": recent_tx,
+    }
 
 
 def run_read_only_sql(sql_query: str) -> List[Dict[str, Any]]:
