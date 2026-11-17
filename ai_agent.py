@@ -1,9 +1,12 @@
 import json
+import logging
 import re
 import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("mybca-ai")
 
 from google import genai
 from google.genai import types
@@ -199,15 +202,25 @@ def _record_working_model(model_name: str) -> None:
     _LAST_WORKING_TS = time.monotonic()
 
 
-def _model_candidates() -> List[str]:
+def build_thinking_config(model_name: str) -> types.ThinkingConfig:
+    """Selects a version-compatible ThinkingConfig (Gemini 2.5 uses thinking_budget; 3.x+ uses thinking_level)."""
+    lower = (model_name or "").strip().lower()
+    if lower.startswith("gemini-2.") or "gemini-2.5" in lower:
+        return types.ThinkingConfig(thinking_budget=0)
+    return types.ThinkingConfig(thinking_level="LOW")
+
+
+def _model_candidates(prefer_model: Optional[str] = None) -> List[str]:
     seen = set()
     ordered = []
-    for m in [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS:
+    raw_list = ([prefer_model] if prefer_model else []) + [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS
+    for m in raw_list:
         if m and m not in seen:
             seen.add(m)
             ordered.append(m)
     if (
-        _LAST_WORKING_MODEL
+        not prefer_model
+        and _LAST_WORKING_MODEL
         and _LAST_WORKING_MODEL in ordered
         and (time.monotonic() - _LAST_WORKING_TS) < 900.0
     ):
@@ -218,6 +231,8 @@ def _model_candidates() -> List[str]:
 
 def _is_retryable_model_error(err: Exception) -> bool:
     msg = str(err).upper()
+    if "400" in msg and any(k in msg for k in ("THINKING", "NOT SUPPORTED", "UNSUPPORTED", "NOT ENABLED")):
+        return True
     return any(
         token in msg
         for token in (
@@ -227,6 +242,7 @@ def _is_retryable_model_error(err: Exception) -> bool:
             "NOT_FOUND",
             "TIMEOUT",
             "READTIMEOUT",
+            "TIMED OUT",
             "DEADLINE_EXCEEDED",
             "500",
             "502",
@@ -293,7 +309,7 @@ def transcribe_audio_with_gemini(
         raise ValueError("Audio recording is empty.")
 
     clean_mime = normalize_audio_mime_type(mime_type, filename=filename)
-    client = _get_genai_client(timeout_ms=25000)
+    client = _get_genai_client(timeout_ms=18000)
     prompt = (
         "Transcribe this spoken audio verbatim in its original language (Indonesian or English), "
         "preserving numbers, currency amounts, dates, and merchant names. "
@@ -310,7 +326,7 @@ def transcribe_audio_with_gemini(
                     prompt,
                 ],
                 config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_level="LOW"),
+                    thinking_config=build_thinking_config(model_name),
                     temperature=0.0,
                 ),
             )
@@ -324,6 +340,7 @@ def transcribe_audio_with_gemini(
         except Exception as e:
             last_err = e
             if _is_retryable_model_error(e):
+                logger.warning("Gemini audio model %s failed (%s); falling back", model_name, type(e).__name__)
                 continue
             raise
 
@@ -379,24 +396,26 @@ Core Guidelines:
 5. Formatting: Output clean PLAIN TEXT only. Do NOT use Markdown syntax (`**`, `*`, `#`, `###`, `---`, backticks, or Markdown tables). Instead, use clean line breaks, emoji/plain-text section headers, and `•` Unicode bullets for lists, keeping responses under 3,500 characters.
 """
 
-    client = _get_genai_client(timeout_ms=18000)
+    client = _get_genai_client(timeout_ms=10000)
     history = []
     if chat_history:
         for msg in chat_history[-6:]:
             role = "user" if msg["role"] == "user" else "model"
             history.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["text"])]))
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        tools=[execute_sql_query, log_manual_transaction, recategorize_merchant],
-        thinking_config=types.ThinkingConfig(thinking_level="LOW"),
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=2),
-        temperature=0.1,
-    )
+    tools_list = [execute_sql_query, log_manual_transaction, recategorize_merchant]
+    afc_cfg = types.AutomaticFunctionCallingConfig(maximum_remote_calls=2)
 
     last_err: Exception | None = None
     for model_name in _model_candidates():
         try:
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=tools_list,
+                thinking_config=build_thinking_config(model_name),
+                automatic_function_calling=afc_cfg,
+                temperature=0.1,
+            )
             chat = client.chats.create(model=model_name, config=config, history=history or None)
             response = chat.send_message(user_question)
             raw_text = response.text or "I processed your request, but no text response was generated."
@@ -405,6 +424,7 @@ Core Guidelines:
         except Exception as e:
             last_err = e
             if _is_retryable_model_error(e):
+                logger.warning("Gemini model %s failed (%s); falling back", model_name, type(e).__name__)
                 continue
             raise
 

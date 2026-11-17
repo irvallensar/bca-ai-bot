@@ -5,7 +5,14 @@ from typing import Any, Dict, List
 from google import genai
 from google.genai import types
 
-from config import GEMINI_API_KEY, GEMINI_FALLBACK_MODELS, GEMINI_MODEL, MYBCA_CATEGORIES
+from ai_agent import (
+    _get_genai_client,
+    _is_retryable_model_error,
+    _model_candidates,
+    _record_working_model,
+    build_thinking_config,
+)
+from config import GEMINI_API_KEY, MYBCA_CATEGORIES
 from database import init_db, reconcile_and_upsert_statement_transactions
 from email_parser import guess_category
 
@@ -142,16 +149,12 @@ def parse_and_ingest_statement_file(file_bytes: bytes, mime_type: str = "applica
     init_db()
     resolved_mime = detect_statement_mime_type(file_bytes, mime_type=mime_type) or mime_type or "application/pdf"
     prompt = build_statement_extraction_prompt()
-    client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=60000))
+    client = _get_genai_client(timeout_ms=45000)
 
-    candidates = []
-    for m in [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS:
-        if m and m not in candidates:
-            candidates.append(m)
-
+    prefer_vision = "gemini-3.6-flash" if resolved_mime == "application/pdf" else None
     response = None
     last_err: Exception | None = None
-    for model_name in candidates:
+    for model_name in _model_candidates(prefer_model=prefer_vision):
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -161,33 +164,15 @@ def parse_and_ingest_statement_file(file_bytes: bytes, mime_type: str = "applica
                 ],
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    thinking_config=types.ThinkingConfig(thinking_level="LOW"),
+                    thinking_config=build_thinking_config(model_name),
                     temperature=0.1,
                 ),
             )
+            _record_working_model(model_name)
             break
         except Exception as e:
             last_err = e
-            msg = str(e).upper()
-            if any(
-                t in msg
-                for t in (
-                    "429",
-                    "RESOURCE_EXHAUSTED",
-                    "404",
-                    "NOT_FOUND",
-                    "TIMEOUT",
-                    "READTIMEOUT",
-                    "DEADLINE_EXCEEDED",
-                    "500",
-                    "502",
-                    "503",
-                    "504",
-                    "UNAVAILABLE",
-                    "INTERNAL",
-                    "SERVERERROR",
-                )
-            ):
+            if _is_retryable_model_error(e):
                 continue
             raise
 
