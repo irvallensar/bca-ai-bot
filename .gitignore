@@ -5,6 +5,21 @@
 .env
 .env.*
 !.env.example
+*.local
+
+# Personal bank statements, screenshots, voice notes & logs
+*.pdf
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.heic
+*.webp
+*.ogg
+*.m4a
+*.mp3
+*.wav
+*.log
 
 # Python cache & virtual environments
 __pycache__/
