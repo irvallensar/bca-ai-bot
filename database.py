@@ -153,6 +153,14 @@ def init_db() -> None:
     );
     """
 
+    create_state_table = f"""
+    CREATE TABLE IF NOT EXISTS bot_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT {ts_default}
+    );
+    """
+
     create_indexes = [
         "CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(tx_date);",
         "CREATE INDEX IF NOT EXISTS idx_tx_month ON transactions(tx_month);",
@@ -166,10 +174,50 @@ def init_db() -> None:
         cur = conn.cursor()
         cur.execute(create_tx_table)
         cur.execute(create_rules_table)
+        cur.execute(create_state_table)
         for idx_sql in create_indexes:
             cur.execute(idx_sql)
 
     _INITIALIZED_DB_URL = DATABASE_URL
+
+
+def get_bot_state(key: str) -> Optional[str]:
+    """Reads a persisted key-value state entry (e.g. last monthly reminder sent)."""
+    init_db()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        ph = "%s" if IS_POSTGRES else "?"
+        cur.execute(f"SELECT value FROM bot_state WHERE key = {ph};", (key,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        val = _extract_col(row, 0, "value")
+        return str(val) if val is not None else None
+
+
+def set_bot_state(key: str, value: str) -> None:
+    """Upserts a persisted key-value state entry across restarts/deploys."""
+    init_db()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        if IS_POSTGRES:
+            cur.execute(
+                """
+                INSERT INTO bot_state (key, value, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
+                """,
+                (key, value),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO bot_state (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP;
+                """,
+                (key, value),
+            )
 
 
 def compute_dedup_key(

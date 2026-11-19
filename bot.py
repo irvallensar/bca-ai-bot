@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set
 
 import uvicorn
@@ -27,7 +28,7 @@ from config import (
     TELEGRAM_BOT_TOKEN,
     WEBHOOK_URL,
 )
-from database import init_db, run_read_only_sql
+from database import get_bot_state, init_db, run_read_only_sql, set_bot_state
 from gmail_sync import sync_from_gmail_imap
 from statement_parser import (
     detect_statement_mime_type,
@@ -310,8 +311,54 @@ def _register_handlers(app_instance: Application) -> None:
     app_instance.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
 
+WIB_TZ = timezone(timedelta(hours=7))
+MONTHLY_REMINDER_STATE_KEY = "monthly_statement_reminder_last_sent"
+
+
+async def maybe_send_monthly_statement_reminder(now_wib: datetime | None = None) -> bool:
+    """
+    Sends a once-per-month Telegram reminder on the 1st day of the month (>= 09:00 WIB)
+    prompting the user to download the previous month's myBCA e-Statement PDF and upload it.
+    Persists the sent YYYY-MM month in `bot_state` so Render restarts never duplicate alerts.
+    """
+    if not telegram_app or not ALLOWED_TELEGRAM_USER_IDS:
+        return False
+
+    current = now_wib or datetime.now(WIB_TZ)
+    if current.day != 1 or current.hour < 9:
+        return False
+
+    current_ym = current.strftime("%Y-%m")
+    last_sent = await asyncio.to_thread(get_bot_state, MONTHLY_REMINDER_STATE_KEY)
+    if last_sent == current_ym:
+        return False
+
+    prev_month_label = (current.replace(day=1) - timedelta(days=1)).strftime("%B %Y")
+    reminder_text = (
+        f"📅 *Monthly e-Statement Reminder*\n\n"
+        f"Happy 1st of the month! Your *{prev_month_label}* myBCA e-Statement PDF is ready.\n\n"
+        f"*Quick steps:*\n"
+        f"1. Open *myBCA* → *e-Statement* → download *{prev_month_label}* PDF.\n"
+        f"2. Send the PDF directly into this chat.\n\n"
+        f"I'll automatically skip transactions already synced from Gmail, add any missing incoming (`CR`) transfers or silent bank fees, and reconcile overseas (`JPY`) FX rates."
+    )
+
+    sent_any = False
+    for uid in ALLOWED_TELEGRAM_USER_IDS:
+        try:
+            await telegram_app.bot.send_message(chat_id=uid, text=reminder_text, parse_mode="Markdown")
+            sent_any = True
+        except Exception as e:
+            logger.warning("Failed sending monthly reminder to user %s: %s", uid, e)
+
+    if sent_any:
+        await asyncio.to_thread(set_bot_state, MONTHLY_REMINDER_STATE_KEY, current_ym)
+        logger.info("Sent monthly e-Statement reminder for %s (%s)", prev_month_label, current_ym)
+    return sent_any
+
+
 async def periodic_gmail_sync_task() -> None:
-    """Background task that backfills full history on startup and polls recent Gmail every N minutes."""
+    """Background task that backfills full history on startup, polls Gmail, and triggers monthly reminders."""
     is_first_run = True
     while True:
         if GMAIL_APP_PASSWORD:
@@ -330,6 +377,12 @@ async def periodic_gmail_sync_task() -> None:
             except Exception as e:
                 logger.warning("Background Gmail sync warning: %s", e)
             is_first_run = False
+
+        try:
+            await maybe_send_monthly_statement_reminder()
+        except Exception as e:
+            logger.warning("Monthly statement reminder check warning: %s", e)
+
         await asyncio.sleep(EMAIL_SYNC_INTERVAL_SECONDS)
 
 
@@ -350,7 +403,6 @@ async def _process_webhook_update(update: Update) -> None:
 async def lifespan(app: FastAPI):
     global telegram_app, bg_sync_task
     init_db()
-    bg_sync_task = asyncio.create_task(periodic_gmail_sync_task())
 
     if TELEGRAM_BOT_TOKEN:
         builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
@@ -377,6 +429,8 @@ async def lifespan(app: FastAPI):
             logger.info("Telegram bot started in POLLING mode.")
     else:
         logger.warning("TELEGRAM_BOT_TOKEN not set yet. Running web server only.")
+
+    bg_sync_task = asyncio.create_task(periodic_gmail_sync_task())
 
     yield
 
