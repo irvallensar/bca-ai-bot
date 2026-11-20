@@ -11,6 +11,8 @@ from typing import Dict, List, Set
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from telegram import Update
+from telegram.error import NetworkError, TimedOut
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -44,6 +46,28 @@ logger = logging.getLogger("mybca-bot")
 # Simple in-memory conversation memory per Telegram user or iOS Shortcut session
 USER_HISTORY: Dict[int | str, List[Dict[str, str]]] = {}
 SYNC_LOCK = asyncio.Lock()
+
+# Seconds allowed for Telegram Bot API calls and file downloads (PTB's default is only 5s).
+TELEGRAM_HTTP_TIMEOUT = 60.0
+
+
+async def download_telegram_file_bytes(media, attempts: int = 3) -> bytes:
+    """Downloads a Telegram voice/audio/document file with generous timeouts and retries on transient errors."""
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            tg_file = await media.get_file(read_timeout=TELEGRAM_HTTP_TIMEOUT, connect_timeout=15.0)
+            return bytes(
+                await tg_file.download_as_bytearray(
+                    read_timeout=TELEGRAM_HTTP_TIMEOUT,
+                    connect_timeout=15.0,
+                )
+            )
+        except (TimedOut, NetworkError) as e:
+            last_err = e
+            logger.warning("Telegram file download attempt %d/%d failed: %s", attempt, attempts, e)
+            await asyncio.sleep(1.5 * attempt)
+    raise last_err if last_err else RuntimeError("Telegram file download failed.")
 
 
 def _append_history(session_key: int | str, question: str, answer: str) -> None:
@@ -233,8 +257,7 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     filename = getattr(media, "file_name", "") or ""
     thinking_msg = await update.message.reply_text("🎙 Listening to your voice message...")
     try:
-        tg_file = await media.get_file()
-        audio_bytes = bytes(await tg_file.download_as_bytearray())
+        audio_bytes = await download_telegram_file_bytes(media)
         history = list(USER_HISTORY.get(uid, []))
         result = await asyncio.to_thread(
             answer_audio_question,
@@ -261,13 +284,12 @@ async def handle_document_or_photo(update: Update, context: ContextTypes.DEFAULT
         if update.message.document:
             doc = update.message.document
             mime_type = doc.mime_type or "application/pdf"
-            tg_file = await doc.get_file()
+            file_bytes = await download_telegram_file_bytes(doc)
         else:
             photo = update.message.photo[-1]
             mime_type = "image/jpeg"
-            tg_file = await photo.get_file()
+            file_bytes = await download_telegram_file_bytes(photo)
 
-        file_bytes = bytes(await tg_file.download_as_bytearray())
         result = await asyncio.to_thread(parse_and_ingest_statement_file, file_bytes, mime_type)
         summary_md = format_statement_sync_summary(result, markdown=True)
         await status_msg.edit_text(summary_md, parse_mode="Markdown")
@@ -405,7 +427,22 @@ async def lifespan(app: FastAPI):
     init_db()
 
     if TELEGRAM_BOT_TOKEN:
-        builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+        # PTB defaults to 5s read/connect timeouts, which are too short for downloading voice/audio/PDF
+        # files from Telegram (especially from a Render free-tier container) and raise `telegram.error.TimedOut`.
+        builder = (
+            Application.builder()
+            .token(TELEGRAM_BOT_TOKEN)
+            .request(
+                HTTPXRequest(
+                    connection_pool_size=32,
+                    read_timeout=TELEGRAM_HTTP_TIMEOUT,
+                    write_timeout=TELEGRAM_HTTP_TIMEOUT,
+                    connect_timeout=15.0,
+                    pool_timeout=15.0,
+                    media_write_timeout=TELEGRAM_HTTP_TIMEOUT,
+                )
+            )
+        )
         if WEBHOOK_URL:
             # Webhook mode for Render / cloud hosting: wakes sleeping free-tier containers and avoids polling conflicts
             telegram_app = builder.updater(None).build()
