@@ -11,12 +11,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./mybca_transactions.db").st
 
 # Google Gemini API Key (Free tier from https://aistudio.google.com/apikey)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip()
 GEMINI_FALLBACK_MODELS = [
     m.strip()
     for m in os.getenv(
         "GEMINI_FALLBACK_MODELS",
-        "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-3.6-flash,gemini-2.5-flash",
+        "gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-3.5-flash,gemini-3.8-flash,gemini-3.6-flash",
     ).split(",")
     if m.strip()
 ]

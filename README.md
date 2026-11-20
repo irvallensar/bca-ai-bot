@@ -23,7 +23,7 @@ This system continuously ingests bank and subscription emails via Gmail IMAP, ex
    - **Single-Connection Cached SQL Snapshot:** Consolidates 5 summary queries into 1 database connection (`fetch_financial_snapshot`) cached in memory (invalidated automatically on writes), paired with read-only `execute_sql_query`, `log_manual_transaction`, and `recategorize_merchant` tool calling.
    - **Voice & Audio Support:** Transcribes Telegram voice messages (`audio/ogg`, `audio/mp4`, `audio/wav`) and raw audio uploads via Gemini multimodal audio before routing to the SQL advisor.
    - **Native iOS Integration (`POST /api/ask`, `/api/ingest`):** Authenticated JSON, raw audio, and raw image/PDF endpoint (with magic-byte detection) designed for **iPhone Apple Shortcuts & Back Tap**—enabling both voice Q&A and 1-tap `Take Screenshot` incoming-transfer sync outside Telegram.
-   - **Multi-Generation Gemini Failover:** Defaults to `gemini-3.5-flash-lite` with automatic cascade across `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite`, `gemini-3.6-flash`, and `gemini-2.5-flash`, version-aware `ThinkingConfig` (`thinking_budget=0` for 2.5 vs. `thinking_level=LOW` for 3.x), `10s` fail-fast chat timeouts, and 15-minute sticky model promotion.
+   - **Multi-Generation Gemini Failover:** Defaults to `gemini-3.1-flash-lite` with automatic cascade across `gemini-3.5-flash-lite`, `gemini-3.5-flash`, `gemini-3.8-flash`, and `gemini-3.6-flash`, version-aware `ThinkingConfig` (`thinking_budget=0` for 2.5 vs. `thinking_level=LOW` for 3.x), `10s` fail-fast chat timeouts, and 15-minute sticky model promotion.
 
 ---
 
